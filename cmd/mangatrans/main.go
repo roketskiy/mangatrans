@@ -377,6 +377,28 @@ func main() {
 	}
 	b.WriteMS = time.Since(tWrite).Milliseconds()
 	log.Printf("wrote %s (%d pages)", *out, len(outPages))
+
+	// Read the output back and decode every page. This catches a truncated
+	// zip or an encoder failure before the user opens the file.
+	tValidate := time.Now()
+	if check, err := cbz.ReadCBZ(*out); err != nil {
+		log.Printf("validate output: %v", err)
+	} else {
+		bad := 0
+		for _, p := range check {
+			if _, err := decodeImage(p.Bytes); err != nil {
+				bad++
+			}
+		}
+		if len(check) != len(outPages) {
+			log.Printf("validate output: %d pages, expected %d", len(check), len(outPages))
+		} else if bad > 0 {
+			log.Printf("validate output: %d of %d pages do not decode", bad, len(check))
+		} else {
+			log.Printf("validate output: %d pages, all decode", len(check))
+		}
+	}
+	b.ValidateMS = time.Since(tValidate).Milliseconds()
 	b.report(log.Printf, time.Since(started))
 	if *benchPath != "" {
 		if err := b.writeJSON(*benchPath); err != nil {
@@ -424,6 +446,7 @@ type bench struct {
 	RenderMS        int64 `json:"render_ms"`
 	EncodeMS        int64 `json:"encode_ms"`
 	WriteMS         int64 `json:"write_ms"`
+	ValidateMS      int64 `json:"validate_ms"`
 	LoadOCRMS       int64 `json:"load_ocr_ms"`
 	LoadDetMS       int64 `json:"load_det_ms"`
 	LoadMTMS        int64 `json:"load_mt_ms"`
@@ -439,8 +462,8 @@ func (b *bench) report(logf func(string, ...any), total time.Duration) {
 		b.Pages, b.Blocks, b.Chars, total.Round(time.Millisecond))
 	logf("  model load: ocr=%s det=%s mt=%s lama=%s",
 		ms(b.LoadOCRMS), ms(b.LoadDetMS), ms(b.LoadMTMS), ms(b.LoadLamaMS))
-	logf("  io: read=%s write=%s decode=%s encode=%s",
-		ms(b.ReadMS), ms(b.WriteMS), ms(b.DecodeMS), ms(b.EncodeMS))
+	logf("  io: read=%s write=%s validate=%s decode=%s encode=%s",
+		ms(b.ReadMS), ms(b.WriteMS), ms(b.ValidateMS), ms(b.DecodeMS), ms(b.EncodeMS))
 	if b.Pages > 0 {
 		logf("  detect: %s (%s/page)", ms(b.DetectMS), ms(int64(float64(b.DetectMS)/pages)))
 	}
