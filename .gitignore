@@ -12,3 +12,6 @@ skills-lock.json
 
 # Local tool checkout
 koharu-slim/
+
+# Local binaries
+*.exe
