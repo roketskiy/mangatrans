@@ -74,6 +74,7 @@ go build -o bin\mangatrans.exe .\cmd\mangatrans
 | `-mt-model PATH` | 翻译 GGUF |
 | `-font PATH` | 译文字体，默认 `msyhbd.ttc` |
 | `-glossary PATH` | 术语表，JSON 映射或每行 `原文=译文` |
+| `-bench-json PATH` | 结束时把分阶段耗时写成 JSON |
 
 环境变量（都可选）：
 
@@ -98,6 +99,22 @@ go build -o bin\mangatrans.exe .\cmd\mangatrans
 ```
 
 界面构建需要 Go 1.27（脚本使用 `.cache\go1.27`），引擎仍用 Go 1.26 + cgo。两个 exe 必须放在同一目录，或者用 `MANGATRANS_EXE` 指向引擎。
+
+## 性能基准
+
+整本 11 页（822x1200），CUDA 13，Hy-MT2-1.8B Q4：
+
+| 阶段 | 耗时 | 吞吐 |
+| --- | --- | --- |
+| 检测 | 1.73 s | 157 ms/页 |
+| OCR | 8.30 s | 133 ms/框，7.5 框/s |
+| 翻译 | 8.46 s | 136 ms/块，7.3 块/s |
+| 擦字 | 12.81 s | 1.16 s/页 |
+| 排版 | 0.59 s | 53 ms/页 |
+| 模型加载 | 12.63 s | 一次性 |
+| 总计 | 45.4 s | 4.13 s/页，14.5 页/分钟 |
+
+`.\bench.ps1` 会重跑这本测试书，并在输出 CBZ 旁写一份 `bench.json`，字段是各阶段毫秒数、页数、框数和字数。
 
 ## 实测
 

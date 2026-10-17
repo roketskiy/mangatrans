@@ -244,8 +244,7 @@ func (a *app) handleLine(raw string) {
 	a.invalidate()
 }
 
-func truncateLine(s string, n int) string {
-	r := []rune(s)
+func truncateLine(s string, n int) string {	r := []rune(s)
 	if len(r) <= n {
 		return s
 	}

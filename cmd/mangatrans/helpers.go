@@ -144,6 +144,24 @@ func textColor(img image.Image, box image.Rectangle) color.RGBA {
 	return color.RGBA{R: 255, G: 255, B: 255, A: 255}
 }
 
+// centered reports whether the text box sits near the middle of the bubble.
+// Expanding a box that hugs one side would move the translation into the
+// tapered part of an irregular bubble.
+func centered(box, bubble image.Rectangle) bool {
+	if bubble.Empty() {
+		return false
+	}
+	dx := (box.Min.X+box.Max.X)/2 - (bubble.Min.X+bubble.Max.X)/2
+	dy := (box.Min.Y+box.Max.Y)/2 - (bubble.Min.Y+bubble.Max.Y)/2
+	if dx < 0 {
+		dx = -dx
+	}
+	if dy < 0 {
+		dy = -dy
+	}
+	return dx*100 <= 12*bubble.Dx() && dy*100 <= 12*bubble.Dy()
+}
+
 type blockDump struct {
 	Box      image.Rectangle `json:"box"`
 	Vertical bool            `json:"vertical"`

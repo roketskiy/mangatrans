@@ -82,6 +82,10 @@ type Block struct {
 	Box      image.Rectangle
 	Text     string
 	Vertical bool
+	// Anchor, when set, is the speech-bubble rectangle used for placement.
+	// Box still controls the font size, so a longer translation cannot grow
+	// past the original text footprint and leave the bubble.
+	Anchor image.Rectangle
 	// TextColor is chosen per block from the original glyph colour. The zero
 	// value falls back to Options.TextColor.
 	TextColor color.RGBA
@@ -205,7 +209,17 @@ func Render(page image.Image, blocks []Block, opt Options) (image.Image, error) 
 		if err != nil {
 			return nil, fmt.Errorf("decode block layer: %w", err)
 		}
-		draw.Draw(out, usable, layer, image.Point{}, draw.Over)
+		anchor := b.Anchor
+		if anchor.Empty() {
+			anchor = b.Box
+		}
+		dst := image.Rect(
+			anchor.Min.X+(anchor.Dx()-usable.Dx())/2,
+			anchor.Min.Y+(anchor.Dy()-usable.Dy())/2,
+			anchor.Min.X+(anchor.Dx()-usable.Dx())/2+usable.Dx(),
+			anchor.Min.Y+(anchor.Dy()-usable.Dy())/2+usable.Dy(),
+		)
+		draw.Draw(out, dst, layer, image.Point{}, draw.Over)
 	}
 
 	return out, nil

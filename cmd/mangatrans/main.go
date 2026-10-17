@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"image"
@@ -43,10 +44,13 @@ func main() {
 	mtModel := flag.String("mt-model", `E:\work\transl\models\Hy-MT2-1.8B-UD-Q4_K_XL.gguf`, "translation gguf")
 	fontPath := flag.String("font", `C:\Windows\Fonts\msyhbd.ttc`, "font file for translations")
 	glossaryPath := flag.String("glossary", "", "term glossary: JSON map or source=target lines")
+	benchPath := flag.String("bench-json", "", "write stage timings as JSON to this path")
 	flag.Parse()
 	if *in == "" || *out == "" {
 		log.Fatal("usage: mangatrans -in book.cbz -out book.zh.cbz [-work dir] [-limit N]")
 	}
+	started := time.Now()
+	b := &bench{}
 
 	p := paths{
 		llamaExe:  envOr("MANGATRANS_LLAMA", `C:\Users\Public\Temp\opencode\llamacpp\llama\llama-server.exe`),
@@ -64,14 +68,17 @@ func main() {
 		os.MkdirAll(*work, 0o755)
 	}
 
+	tRead := time.Now()
 	pages, err := cbz.ReadCBZ(*in)
 	if err != nil {
 		log.Fatalf("read input: %v", err)
 	}
+	b.ReadMS = time.Since(tRead).Milliseconds()
 	if *limit > 0 && len(pages) > *limit {
 		pages = pages[:*limit]
 	}
 	log.Printf("pages: %d", len(pages))
+	b.Pages = len(pages)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
@@ -79,6 +86,7 @@ func main() {
 	// Stage A: OCR. One llama-server instance, then released so the
 	// translation model can take the same VRAM.
 	log.Printf("starting OCR server")
+	tLoad := time.Now()
 	ocrSrv, err := llm.Start(ctx, llm.Config{
 		Exe: p.llamaExe, Model: p.ocrModel, MMProj: p.ocrMMProj,
 		LogPath: filepath.Join(os.TempDir(), "mangatrans-ocr.log"),
@@ -87,6 +95,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("start OCR server: %v", err)
 	}
+	b.LoadOCRMS = time.Since(tLoad).Milliseconds()
 
 	rt, err := infer.Env(p.ortDir, p.cudaDir)
 	if err != nil {
@@ -94,10 +103,12 @@ func main() {
 	}
 	defer rt.Destroy()
 
+	tLoad = time.Now()
 	det, err := detect.Load(p.detModel, true, 3<<30)
 	if err != nil {
 		log.Fatalf("load detector: %v", err)
 	}
+	b.LoadDetMS = time.Since(tLoad).Milliseconds()
 	defer det.Close()
 
 	type pageResult struct {
@@ -116,16 +127,20 @@ func main() {
 
 	ocrStart := time.Now()
 	for i, pg := range pages {
+		tDecode := time.Now()
 		img, err := decodeImage(pg.Bytes)
 		if err != nil {
 			log.Printf("page %d (%s): decode failed: %v", i, pg.Name, err)
 			continue
 		}
+		b.DecodeMS += time.Since(tDecode).Milliseconds()
+		tDetect := time.Now()
 		res, err := det.Run(img, detParams)
 		if err != nil {
 			log.Printf("page %d: detect failed: %v", i, err)
 			continue
 		}
+		b.DetectMS += time.Since(tDetect).Milliseconds()
 
 		pr := &pageResult{index: i, name: pg.Name, img: img, mask: res.Mask}
 		for j, box := range res.Boxes {
@@ -133,7 +148,10 @@ func main() {
 			if crop == nil {
 				continue
 			}
+			tOCR := time.Now()
 			text, err := ocrBox(ctx, ocrSrv, crop)
+			b.OCRMS += time.Since(tOCR).Milliseconds()
+			b.OCRBoxes++
 			if err != nil {
 				log.Printf("page %d box %d: ocr failed: %v", i, j, err)
 				continue
@@ -158,6 +176,7 @@ func main() {
 
 	// Stage B: translation, batched across pages so the model sees context.
 	log.Printf("starting translation server")
+	tLoad = time.Now()
 	mtSrv, err := llm.Start(ctx, llm.Config{
 		Exe: p.llamaExe, Model: p.mtModel,
 		LogPath: filepath.Join(os.TempDir(), "mangatrans-mt.log"),
@@ -166,6 +185,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("start translation server: %v", err)
 	}
+	b.LoadMTMS = time.Since(tLoad).Milliseconds()
 	defer mtSrv.Kill()
 
 	var glossary map[string]string
@@ -188,7 +208,10 @@ func main() {
 				end = len(pr.texts)
 			}
 			batch := pr.texts[start:end]
+			tTr := time.Now()
 			got, err := tr.TranslateBatch(ctx, batch)
+			b.TranslateMS += time.Since(tTr).Milliseconds()
+			b.TranslateBlocks += len(batch)
 			if err != nil {
 				log.Printf("page %d: translate batch failed: %v", pr.index, err)
 				continue
@@ -213,7 +236,9 @@ func main() {
 			if pr.blocks[k].Text != "" {
 				continue
 			}
+			tRetry := time.Now()
 			txt, err := tr.TranslateOne(ctx, pr.ocr[k])
+			b.TranslateMS += time.Since(tRetry).Milliseconds()
 			if err != nil {
 				log.Printf("page %d block %d: single retry failed: %v", pr.index, k+1, err)
 				continue
@@ -225,6 +250,14 @@ func main() {
 		}
 	}
 	log.Printf("single-line retries: %d", retries)
+	for _, pr := range results {
+		for _, blk := range pr.blocks {
+			if blk.Text != "" {
+				b.Blocks++
+				b.Chars += len([]rune(blk.Text))
+			}
+		}
+	}
 
 	log.Printf("translation done in %s", time.Since(mtStart).Round(time.Second))
 	for _, pr := range results {
@@ -239,16 +272,18 @@ func main() {
 
 	// Stage C: erase original text, then draw translations.
 	log.Printf("starting inpainting")
+	tLoad = time.Now()
 	lap, err := inpaint.Load(p.lapModel, true, 3<<30)
 	if err != nil {
 		log.Fatalf("load inpaint model: %v", err)
 	}
+	b.LoadLamaMS = time.Since(tLoad).Milliseconds()
 	defer lap.Close()
 
 	renderOpt := render.Options{
 		FontPath:  p.fontPath,
 		MinSize:   1.2,
-		MaxSize:   24.0,
+		MaxSize:   16.0,
 		Padding:   3,
 		TextColor: color.RGBA{A: 255},
 	}
@@ -279,19 +314,26 @@ func main() {
 			outPages = append(outPages, pg)
 			continue
 		}
-		// Lay the translation out in the speech bubble rather than the tight
-		// OCR box. This keeps longer text inside the outline and lets the font
-		// grow to the bubble's real size.
+		// Build the inpaint mask from the original OCR boxes, before bubble
+		// fitting changes anything. The mask must cover every original glyph,
+		// including those outside the bubble's largest inner rectangle.
+		mask := restrictMask(pr.mask, active)
+		// Centre the translation in the speech bubble, but keep the original
+		// text footprint for sizing. A longer translation then cannot grow
+		// past the space the artist left for text.
 		finder := bubble.Find(pr.img, 210)
 		usedBubble := make(map[image.Rectangle]bool, len(active))
 		for k := range active {
-			if r, ok := finder.Fit(active[k].Box); ok && !usedBubble[r] {
-				active[k].Box = r
+			if r, ok := finder.Fit(active[k].Box); ok && !usedBubble[r] && centered(active[k].Box, r) {
+				active[k].Anchor = r
 				usedBubble[r] = true
 			}
-			active[k].TextColor = textColor(pr.img, active[k].Box)
+			sample := active[k].Box
+			if !active[k].Anchor.Empty() {
+				sample = active[k].Anchor
+			}
+			active[k].TextColor = textColor(pr.img, sample)
 		}
-		mask := restrictMask(pr.mask, active)
 		if *work != "" {
 			writePNG(filepath.Join(*work, fmt.Sprintf("mask%02d.png", i)), mask)
 			dumps := make([]blockDump, 0, len(pr.blocks))
@@ -300,17 +342,23 @@ func main() {
 			}
 			writeBlocks(filepath.Join(*work, fmt.Sprintf("blocks%02d.json", i)), dumps)
 		}
+		tInpaint := time.Now()
 		clean, err := lap.Inpaint(pr.img, mask)
+		b.InpaintMS += time.Since(tInpaint).Milliseconds()
 		if err != nil {
 			log.Printf("page %d: inpaint failed: %v", i, err)
 			clean = pr.img
 		}
+		tRender := time.Now()
 		final, err := render.Render(clean, active, renderOpt)
+		b.RenderMS += time.Since(tRender).Milliseconds()
 		if err != nil {
 			log.Printf("page %d: render failed: %v", i, err)
 			final = clean
 		}
+		tEncode := time.Now()
 		data, err := encodeJPEG(final, 92)
+		b.EncodeMS += time.Since(tEncode).Milliseconds()
 		if err != nil {
 			log.Printf("page %d: encode failed: %v", i, err)
 			outPages = append(outPages, pg)
@@ -323,10 +371,20 @@ func main() {
 	}
 	log.Printf("finish done in %s", time.Since(finishStart).Round(time.Second))
 
+	tWrite := time.Now()
 	if err := cbz.WriteCBZ(*out, outPages); err != nil {
 		log.Fatalf("write output: %v", err)
 	}
+	b.WriteMS = time.Since(tWrite).Milliseconds()
 	log.Printf("wrote %s (%d pages)", *out, len(outPages))
+	b.report(log.Printf, time.Since(started))
+	if *benchPath != "" {
+		if err := b.writeJSON(*benchPath); err != nil {
+			log.Printf("write benchmark json: %v", err)
+		} else {
+			log.Printf("benchmark json: %s", *benchPath)
+		}
+	}
 }
 
 func isNoise(s string) bool {
@@ -347,4 +405,75 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// bench accumulates per-stage timings for the end-of-run report. The counters
+// make throughput comparable between books of different sizes.
+type bench struct {
+	Pages           int   `json:"pages"`
+	Blocks          int   `json:"blocks"`
+	Chars           int   `json:"chars"`
+	ReadMS          int64 `json:"read_ms"`
+	DecodeMS        int64 `json:"decode_ms"`
+	DetectMS        int64 `json:"detect_ms"`
+	OCRMS           int64 `json:"ocr_ms"`
+	OCRBoxes        int   `json:"ocr_boxes"`
+	TranslateMS     int64 `json:"translate_ms"`
+	TranslateBlocks int   `json:"translate_blocks"`
+	InpaintMS       int64 `json:"inpaint_ms"`
+	RenderMS        int64 `json:"render_ms"`
+	EncodeMS        int64 `json:"encode_ms"`
+	WriteMS         int64 `json:"write_ms"`
+	LoadOCRMS       int64 `json:"load_ocr_ms"`
+	LoadDetMS       int64 `json:"load_det_ms"`
+	LoadMTMS        int64 `json:"load_mt_ms"`
+	LoadLamaMS      int64 `json:"load_lama_ms"`
+	TotalMS         int64 `json:"total_ms"`
+}
+
+func (b *bench) report(logf func(string, ...any), total time.Duration) {
+	b.TotalMS = total.Milliseconds()
+	pages := float64(b.Pages)
+
+	logf("benchmark: pages=%d blocks=%d chars=%d total=%s",
+		b.Pages, b.Blocks, b.Chars, total.Round(time.Millisecond))
+	logf("  model load: ocr=%s det=%s mt=%s lama=%s",
+		ms(b.LoadOCRMS), ms(b.LoadDetMS), ms(b.LoadMTMS), ms(b.LoadLamaMS))
+	logf("  io: read=%s write=%s decode=%s encode=%s",
+		ms(b.ReadMS), ms(b.WriteMS), ms(b.DecodeMS), ms(b.EncodeMS))
+	if b.Pages > 0 {
+		logf("  detect: %s (%s/page)", ms(b.DetectMS), ms(int64(float64(b.DetectMS)/pages)))
+	}
+	if b.OCRBoxes > 0 {
+		logf("  ocr: %s for %d boxes (%s/box, %.1f boxes/s)",
+			ms(b.OCRMS), b.OCRBoxes, ms(b.OCRMS/int64(b.OCRBoxes)), rate(b.OCRBoxes, b.OCRMS))
+	}
+	if b.TranslateBlocks > 0 {
+		logf("  translate: %s for %d blocks (%s/block, %.1f blocks/s)",
+			ms(b.TranslateMS), b.TranslateBlocks, ms(b.TranslateMS/int64(b.TranslateBlocks)), rate(b.TranslateBlocks, b.TranslateMS))
+	}
+	if b.Pages > 0 {
+		logf("  finish: inpaint=%s render=%s (%s/page total)",
+			ms(b.InpaintMS), ms(b.RenderMS), ms(int64(float64(b.InpaintMS+b.RenderMS)/pages)))
+	}
+	if b.TotalMS > 0 && b.Pages > 0 {
+		logf("  wall: %s/page, %.2f pages/min", ms(b.TotalMS/int64(b.Pages)), 60000/float64(b.TotalMS)*pages)
+	}
+}
+
+func (b *bench) writeJSON(path string) error {
+	data, err := json.MarshalIndent(b, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func ms(v int64) time.Duration { return time.Duration(v) * time.Millisecond }
+
+func rate(n int, totalMS int64) float64 {
+	if totalMS <= 0 {
+		return 0
+	}
+	return float64(n) / (float64(totalMS) / 1000)
 }

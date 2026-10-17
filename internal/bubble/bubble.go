@@ -191,7 +191,10 @@ func (f *Finder) Fit(textBox image.Rectangle) (image.Rectangle, bool) {
 	if dx > 6*dy || dy > 6*dx {
 		return image.Rectangle{}, false
 	}
-	return s.rect.Inset(3), true
+	// Use the component bounding box. The largest all-white rectangle is not
+	// suitable: glyphs punch holes in the white region, so it would shrink to
+	// a thin empty margin and make the translation tiny.
+	return s.rect.Inset(2), true
 }
 
 // Debug returns the region label under a point, for probes.
