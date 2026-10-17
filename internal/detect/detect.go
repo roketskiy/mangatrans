@@ -25,19 +25,19 @@ type Model struct {
 
 // Params mirror the reference implementation's postprocessing constants.
 type Params struct {
-	ConfThreshold  float32
-	NMSThreshold   float32
-	BoxDilation    float32
-	MaskThreshold  uint8
-	DilateRadius   int
-	CloseRadius    int
-	FinalDilation  int
-	MinBoxSide     float32
-	MinBoxArea     float32
-	Side           int
+	ConfThreshold float32
+	NMSThreshold  float32
+	BoxDilation   float32
+	MaskThreshold uint8
+	DilateRadius  int
+	CloseRadius   int
+	MinBoxSide    float32
+	MinBoxArea    float32
+	Side          int
 }
 
-// DefaultParams matches koharu-slim's comic_text_detector settings.
+// DefaultParams matches koharu-slim's comic_text_detector settings
+// (crates/koharu-ml/src/comic_text_detector/mod.rs:23-30).
 func DefaultParams() Params {
 	return Params{
 		ConfThreshold: 0.4,
@@ -46,7 +46,6 @@ func DefaultParams() Params {
 		MaskThreshold: 60,
 		DilateRadius:  3,
 		CloseRadius:   10,
-		FinalDilation: 2,
 		MinBoxSide:    6,
 		MinBoxArea:    48,
 		Side:          1024,
@@ -210,41 +209,74 @@ func (m *Model) postprocessYOLO(origW, origH int, layout infer.TensorLayout, p P
 	return outBoxes, outScores
 }
 
+// postprocessMask follows koharu-slim/crates/koharu-ml/src/comic_text_detector/
+// mod.rs:281-330 exactly:
+//
+//	prob   = sigmoid((shrink - thresh) * 50)
+//	fused  = max(prob, unet_mask)
+//	resize to page, threshold 60/255, close(10), dilate(3)
+//
+// Fusing the DBNet probability map matters: the UNet mask alone leaves gaps
+// between strokes, so inpainting only removes fragments of each glyph.
 func (m *Model) postprocessMask(origW, origH int, layout infer.TensorLayout, p Params) *image.Gray {
-	seg := m.seg.GetData()
 	const side = 1024
+	seg := m.seg.GetData()
+	det := m.det.GetData()
+	plane := side * side
 
-	// Binarize at the input resolution, then scale to the page.
-	bin := make([]uint8, side*side)
-	for i := 0; i < side*side; i++ {
-		v := seg[i] * 255
-		if v > float32(p.MaskThreshold) {
-			bin[i] = 255
+	fused := make([]float32, plane)
+	for i := 0; i < plane; i++ {
+		prob := float32(1 / (1 + math.Exp(-float64(det[i]-det[plane+i])*50)))
+		if seg[i] > prob {
+			fused[i] = seg[i]
+		} else {
+			fused[i] = prob
 		}
 	}
 
-	bin = dilate(bin, side, side, p.DilateRadius)
-	bin = erode(bin, side, side, p.CloseRadius)
-	bin = dilate(bin, side, side, p.CloseRadius)
-	bin = dilate(bin, side, side, p.FinalDilation)
-
-	// Nearest-neighbour downscale of the padded square to the page size.
-	out := image.NewGray(image.Rect(0, 0, origW, origH))
+	// Bilinear sample of the padded square to page resolution. Letterbox puts
+	// the page at the origin, so page (x,y) maps to source (x*sx, y*sy).
 	sx := float32(layout.ScaledW) / float32(origW)
 	sy := float32(layout.ScaledH) / float32(origH)
+	bin := make([]uint8, origW*origH)
 	for y := 0; y < origH; y++ {
-		iy := int(float32(y) * sy)
-		if iy >= side {
-			iy = side - 1
+		fy := (float32(y)+0.5)*sy - 0.5
+		if fy < 0 {
+			fy = 0
 		}
+		y0 := int(fy)
+		y1 := y0 + 1
+		if y1 >= side {
+			y1 = side - 1
+		}
+		wy := fy - float32(y0)
 		for x := 0; x < origW; x++ {
-			ix := int(float32(x) * sx)
-			if ix >= side {
-				ix = side - 1
+			fx := (float32(x)+0.5)*sx - 0.5
+			if fx < 0 {
+				fx = 0
 			}
-			out.Pix[y*out.Stride+x] = bin[iy*side+ix]
+			x0 := int(fx)
+			x1 := x0 + 1
+			if x1 >= side {
+				x1 = side - 1
+			}
+			wx := fx - float32(x0)
+			v00 := fused[y0*side+x0]
+			v10 := fused[y0*side+x1]
+			v01 := fused[y1*side+x0]
+			v11 := fused[y1*side+x1]
+			v := (v00*(1-wx)+v10*wx)*(1-wy) + (v01*(1-wx)+v11*wx)*wy
+			if v*255 >= float32(p.MaskThreshold) {
+				bin[y*origW+x] = 255
+			}
 		}
 	}
+
+	closed := erode(dilate(bin, origW, origH, p.CloseRadius), origW, origH, p.CloseRadius)
+	closed = dilate(closed, origW, origH, p.DilateRadius)
+
+	out := image.NewGray(image.Rect(0, 0, origW, origH))
+	copy(out.Pix, closed)
 	return out
 }
 

@@ -79,7 +79,7 @@ func (m *Model) Inpaint(src image.Image, textMask *image.Gray) (image.Image, err
 	if !any(mask) {
 		return rgba, nil
 	}
-	dilated := dilate(mask, w, h, 4)
+	dilated := dilate(mask, w, h, 6)
 	components := components(dilated, w, h)
 	for _, r := range components {
 		r = expand(r, 64, w, h)
@@ -88,11 +88,11 @@ func (m *Model) Inpaint(src image.Image, textMask *image.Gray) (image.Image, err
 			windows = split(r)
 		}
 		for _, win := range windows {
-			if solidBackground(rgba, mask, w, win) {
-				fillMasked(rgba, mask, w, win, colorAt(rgba, win))
+			if solidBackground(rgba, dilated, w, win) {
+				fillMasked(rgba, dilated, w, win, colorAt(rgba, win))
 				continue
 			}
-			if err := m.inpaintWindow(rgba, mask, w, win); err != nil {
+			if err := m.inpaintWindow(rgba, dilated, w, win); err != nil {
 				return nil, err
 			}
 		}
@@ -252,6 +252,7 @@ func split(r image.Rectangle) []image.Rectangle {
 	}
 	return o
 }
+
 // solidBackground reports whether the unmasked pixels in the window are close
 // to uniform. Manga bubbles and captions are usually flat white or black, so a
 // small variance lets us skip the model entirely. The threshold is generous:
@@ -290,6 +291,7 @@ func fillMasked(im *image.RGBA, m []uint8, w int, r image.Rectangle, c color.RGB
 		}
 	}
 }
+
 // edgeDistance approximates how deep a masked pixel sits inside the hole, in
 // the 5x5 neighborhood. Pixels at the rim (distance 0) blend with the original
 // image so the patch boundary does not show a hard seam.

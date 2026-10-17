@@ -7,10 +7,72 @@ import (
 	"image/color"
 	"image/draw"
 	"image/png"
+	"math"
+	"strings"
 
 	"github.com/tdewolff/canvas"
 	"github.com/tdewolff/canvas/renderers"
 )
+
+// wrapForMode inserts line breaks so canvas has explicit columns/lines to lay
+// out. canvas does not break CJK text without spaces, so a long translation
+// would otherwise run off one end of the box (seen on page 6 of the test book).
+func wrapForMode(s string, vertical bool, size, aw, ah float64) string {
+	// canvas font sizes are points, while the box is millimetres.
+	const ptToMM = 0.3527778
+	limit := aw
+	if vertical {
+		limit = ah
+	}
+	per := int(limit / (size * ptToMM * 1.1))
+	if per < 1 {
+		per = 1
+	}
+	runes := []rune(s)
+	if len(runes) <= per {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + len(runes)/per)
+	for len(runes) > 0 {
+		n := per
+		if n > len(runes) {
+			n = len(runes)
+		}
+		// Kinsoku: never start a column with closing punctuation, and never
+		// end one with an opening bracket.
+		for n < len(runes) && isClosing(runes[n]) {
+			n++
+		}
+		if n > 1 && n < len(runes) && isOpening(runes[n-1]) {
+			n--
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(string(runes[:n]))
+		runes = runes[n:]
+	}
+	return b.String()
+}
+
+func isClosing(r rune) bool {
+	return strings.ContainsRune("、。，．,.!?！？：；）」』】〕》〉…ー～", r)
+}
+
+func isOpening(r rune) bool {
+	return strings.ContainsRune("（「『【〔《〈", r)
+}
+
+// normalize flattens line breaks. The layout engine wraps by column, so a
+// model that copies the source's line structure would create too many narrow
+// columns and overlap them in a tight bubble.
+func normalize(s string) string {
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\t", "")
+	return strings.TrimSpace(s)
+}
 
 // pxToMM maps page pixels to canvas millimetres. 4 px per mm keeps the
 // rasterised text layer at page resolution.
@@ -20,6 +82,9 @@ type Block struct {
 	Box      image.Rectangle
 	Text     string
 	Vertical bool
+	// TextColor is chosen per block from the original glyph colour. The zero
+	// value falls back to Options.TextColor.
+	TextColor color.RGBA
 }
 
 type Options struct {
@@ -69,12 +134,25 @@ func Render(page image.Image, blocks []Block, opt Options) (image.Image, error) 
 	}
 
 	for _, b := range blocks {
+		b.Text = normalize(b.Text)
 		if b.Text == "" {
 			continue
 		}
+		blockFill := fill
+		if b.TextColor.A != 0 {
+			blockFill = canvas.RGBA(float64(b.TextColor.R)/255, float64(b.TextColor.G)/255,
+				float64(b.TextColor.B)/255, float64(b.TextColor.A)/255)
+		}
+		// Detected boxes hug the original glyphs and can reach the bubble
+		// outline. A proportional inset keeps longer translations away from
+		// the border, where they would spill onto the artwork.
+		pad := opt.Padding
+		if m := 0.07 * math.Min(float64(b.Box.Dx()), float64(b.Box.Dy())); m > pad {
+			pad = m
+		}
 		usable := image.Rect(
-			b.Box.Min.X+int(opt.Padding), b.Box.Min.Y+int(opt.Padding),
-			b.Box.Max.X-int(opt.Padding), b.Box.Max.Y-int(opt.Padding),
+			b.Box.Min.X+int(pad), b.Box.Min.Y+int(pad),
+			b.Box.Max.X-int(pad), b.Box.Max.Y-int(pad),
 		).Intersect(image.Rect(0, 0, w, h))
 		if usable.Dx() < 8 || usable.Dy() < 8 {
 			continue
@@ -84,12 +162,12 @@ func Render(page image.Image, blocks []Block, opt Options) (image.Image, error) 
 		ah := float64(usable.Dy()) * pxToMM
 
 		layout := func(size float64) *canvas.Text {
-			rt := canvas.NewRichText(font.Face(size, fill))
+			rt := canvas.NewRichText(font.Face(size, blockFill))
 			if b.Vertical {
 				rt.SetWritingMode(canvas.VerticalRL)
 				rt.SetTextOrientation(canvas.Upright)
 			}
-			rt.WriteString(b.Text)
+			rt.WriteString(wrapForMode(b.Text, b.Vertical, size, aw, ah))
 			return rt.ToText(aw, ah, canvas.Center, canvas.Center, nil)
 		}
 
@@ -116,7 +194,7 @@ func Render(page image.Image, blocks []Block, opt Options) (image.Image, error) 
 		// top edge sits at ah. ToText centres the ink within that box.
 		c := canvas.New(aw, ah)
 		ctx := canvas.NewContext(c)
-		ctx.SetFillColor(fill)
+		ctx.SetFillColor(blockFill)
 		ctx.DrawText(0, ah, text)
 
 		var buf bytes.Buffer

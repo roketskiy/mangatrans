@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"mangatrans/internal/llm"
@@ -19,28 +21,27 @@ type Block struct {
 // judged the block untranslatable (pure symbols, OCR noise, etc.).
 type Result map[int]string
 
-const systemPrompt = `你是一个专业的漫画翻译器。任务是把日文漫画对白翻译成简体中文。
+const systemPrompt = `你是一个专业的日文漫画翻译，把日文对白翻译成简体中文。
 
-【翻译要求】
-1. 准确保留原意、语气和人物性格，译文要自然口语化，符合中文漫画表达习惯。
-2. 拟声词和感叹词也要翻译。
-3. 人名保留原文读音对应的常见汉字写法，没有把握时保留原文。
-4. 遇到歧义立即选最可能的译法，不解释。
-5. 不添加原文没有的信息。
+【规则】
+1. 译成自然、口语化的中文，保留人物语气，不要书面腔。
+2. 片假名外来语必须译成中文，例如：ガイネン→概念，ギタイ→拟态，ケーキ→蛋糕。
+3. text 里的换行只是排版分行，要先理解整段再翻译，不要逐行直译。
+4. 译文尽量简短，不添加原文没有的信息，不加解释，不加引号或括号。译文写成一行，不要输出换行符。
+5. 人名用常见汉字写法；拟声词、感叹词照常翻译。
+6. 纯符号、页码或 OCR 乱码，text 输出空字符串。
 
-【输入格式】
-输入是 JSON：{"blocks":[{"id":1,"text":"..."},...]}
+【输入】
+{"blocks":[{"id":1,"text":"..."},...]}
 
-【输出格式】
+【输出】
 只输出一个 JSON 对象，不要任何其他文字：
 {"blocks":[{"id":1,"text":"译文"},...]}
-
 每个输入 id 必须对应一个输出 id，不得遗漏、合并或调换顺序。
-无法翻译的块（纯符号、OCR 乱码、页码）text 输出空字符串。
 
 【示例】
-输入：{"blocks":[{"id":1,"text":"宇宙船で来たの？"},{"id":2,"text":"うん"}]}
-输出：{"blocks":[{"id":1,"text":"你是坐宇宙船来的？"},{"id":2,"text":"嗯"}]}`
+输入：{"blocks":[{"id":1,"text":"宇宙船で来たの？"},{"id":2,"text":"うん"},{"id":3,"text":"ガイネン…"},{"id":4,"text":"どうしよ…"}]}
+输出：{"blocks":[{"id":1,"text":"你是坐宇宙船来的？"},{"id":2,"text":"嗯"},{"id":3,"text":"概念…"},{"id":4,"text":"怎么办…"}]}`
 
 // Client translates batches of blocks through a llama-server.
 type Client struct {
@@ -50,84 +51,187 @@ type Client struct {
 // New wraps a running llama-server.
 func New(srv *llm.Server) *Client { return &Client{srv: srv} }
 
-// TranslateBatch sends one batch and parses the JSON reply.
-// Retries once on parse failure before returning the error.
+// TranslateBatch sends one batch and parses the JSON reply. Blocks the model
+// fails to return are retried once on their own; anything still missing is
+// left out of the result so the caller keeps the original text. A partial
+// result is far better than failing a whole page because of one bad object.
 func (c *Client) TranslateBatch(ctx context.Context, blocks []Block) (Result, error) {
 	if len(blocks) == 0 {
 		return Result{}, nil
 	}
 
-	req := struct {
-		Blocks []Block `json:"blocks"`
-	}{Blocks: blocks}
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-
-	msgs := []llm.ChatMessage{
-		{Role: "system", Content: systemPrompt},
-		{Role: "user", Content: string(payload)},
-	}
-
+	result := make(Result, len(blocks))
+	pending := blocks
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		content, err := c.srv.Chat(ctx, msgs, 0.1, 4096)
+
+	for attempt := 0; attempt < 2 && len(pending) > 0; attempt++ {
+		req := struct {
+			Blocks []Block `json:"blocks"`
+		}{Blocks: pending}
+		payload, err := json.Marshal(req)
+		if err != nil {
+			return nil, err
+		}
+		msgs := []llm.ChatMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: string(payload)},
+		}
+		content, err := c.srv.ChatJSON(ctx, msgs, batchSchema, 0.0, 4096)
 		if err != nil {
 			return nil, fmt.Errorf("translate request: %w", err)
 		}
-		result, perr := parseBlocks(content, blocks)
-		if perr == nil {
-			return result, nil
+		got := parseLoose(content)
+		next := pending[:0]
+		for _, b := range pending {
+			if txt, ok := got[b.ID]; ok {
+				result[b.ID] = txt
+			} else {
+				next = append(next, b)
+			}
 		}
-		lastErr = perr
-	}
-	return nil, fmt.Errorf("translate parse after retry: %w", lastErr)
-}
-
-func parseBlocks(content string, blocks []Block) (Result, error) {
-	// The model sometimes wraps JSON in a code fence or prepends prose.
-	content = strings.TrimSpace(content)
-	content = strings.TrimPrefix(content, "```json")
-	content = strings.TrimPrefix(content, "```")
-	content = strings.TrimSuffix(content, "```")
-	content = strings.TrimSpace(content)
-
-	// Find the outermost JSON object.
-	start := strings.IndexByte(content, '{')
-	end := strings.LastIndexByte(content, '}')
-	if start < 0 || end <= start {
-		return nil, fmt.Errorf("no JSON object in reply: %.200q", content)
-	}
-	content = content[start : end+1]
-
-	var parsed struct {
-		Blocks []struct {
-			ID   int    `json:"id"`
-			Text string `json:"text"`
-		} `json:"blocks"`
-	}
-	if err := json.Unmarshal([]byte(content), &parsed); err != nil {
-		return nil, fmt.Errorf("decode %d chars: %w", len(content), err)
+		pending = next
+		lastErr = fmt.Errorf("reply missing %d of %d ids", len(pending), len(blocks))
 	}
 
-	want := make(map[int]bool, len(blocks))
-	for _, b := range blocks {
-		want[b.ID] = true
-	}
-	result := make(Result, len(blocks))
-	seen := make(map[int]bool, len(blocks))
-	for _, b := range parsed.Blocks {
-		if !want[b.ID] || seen[b.ID] {
-			continue
-		}
-		seen[b.ID] = true
-		result[b.ID] = b.Text
-	}
-	for _, b := range blocks {
-		if !seen[b.ID] {
-			return nil, fmt.Errorf("reply missing id %d", b.ID)
-		}
+	if len(result) == 0 && len(blocks) > 0 {
+		return nil, fmt.Errorf("translate parse: %w", lastErr)
 	}
 	return result, nil
+}
+
+var trailingComma = regexp.MustCompile(`,\s*([}\]])`)
+
+// batchSchema lets llama-server constrain generation to the reply shape. It
+// cannot force every id to appear, so parseLoose still validates the result.
+var batchSchema = map[string]any{
+	"type": "object",
+	"properties": map[string]any{
+		"blocks": map[string]any{
+			"type": "array",
+			"items": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id":   map[string]any{"type": "integer"},
+					"text": map[string]any{"type": "string"},
+				},
+				"required":             []string{"id", "text"},
+				"additionalProperties": false,
+			},
+		},
+	},
+	"required":             []string{"blocks"},
+	"additionalProperties": false,
+}
+
+// parseLoose extracts {id, text} pairs from a reply that may contain code
+// fences, prose, concatenated objects or a top-level array. It never fails
+// outright: whatever valid pairs it finds are returned.
+func parseLoose(content string) Result {
+	out := make(Result)
+	content = strings.TrimSpace(content)
+
+	// Fast path: a well-formed {"blocks":[...]} object.
+	if start := strings.IndexByte(content, '{'); start >= 0 {
+		if end := strings.LastIndexByte(content, '}'); end > start {
+			var strict struct {
+				Blocks []struct {
+					ID   json.RawMessage `json:"id"`
+					Text *string         `json:"text"`
+				} `json:"blocks"`
+			}
+			if err := json.Unmarshal([]byte(content[start:end+1]), &strict); err == nil {
+				for _, b := range strict.Blocks {
+					if id, ok := parseID(b.ID); ok && b.Text != nil {
+						if _, dup := out[id]; !dup {
+							out[id] = *b.Text
+						}
+					}
+				}
+				if len(out) > 0 {
+					return out
+				}
+			}
+		}
+	}
+
+	// Slow path: walk every balanced object and keep those that carry both an
+	// "id" and a "text" field. This survives stray commas, markdown and
+	// objects glued together without an array wrapper.
+	for _, obj := range balancedObjects(content) {
+		var one struct {
+			ID   json.RawMessage `json:"id"`
+			Text *string         `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(obj), &one); err != nil {
+			fixed := trailingComma.ReplaceAllString(obj, "$1")
+			if err2 := json.Unmarshal([]byte(fixed), &one); err2 != nil {
+				continue
+			}
+		}
+		if one.Text == nil {
+			continue
+		}
+		id, ok := parseID(one.ID)
+		if !ok {
+			continue
+		}
+		if _, dup := out[id]; !dup {
+			out[id] = *one.Text
+		}
+	}
+	return out
+}
+
+func parseID(raw json.RawMessage) (int, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return 0, false
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(s))
+		return n, err == nil
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// balancedObjects returns every balanced {...} substring, innermost first, so
+// nested block objects are visited before their wrapper.
+func balancedObjects(s string) []string {
+	var out []string
+	var stack []int
+	inString := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inString {
+			if escaped {
+				escaped = false
+			} else if ch == '\\' {
+				escaped = true
+			} else if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			stack = append(stack, i)
+		case '}':
+			if n := len(stack); n > 0 {
+				start := stack[n-1]
+				stack = stack[:n-1]
+				out = append(out, s[start:i+1])
+			}
+		}
+	}
+	return out
 }

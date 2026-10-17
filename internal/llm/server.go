@@ -25,12 +25,12 @@ type Server struct {
 
 // Config for starting a llama-server.
 type Config struct {
-	Exe      string   // path to llama-server.exe
-	Model    string   // path to the gguf
-	MMProj   string   // path to mmproj gguf, empty for text-only
-	Args     []string // extra CLI args
-	LogPath  string   // where to write server output
-	Timeout  time.Duration
+	Exe     string   // path to llama-server.exe
+	Model   string   // path to the gguf
+	MMProj  string   // path to mmproj gguf, empty for text-only
+	Args    []string // extra CLI args
+	LogPath string   // where to write server output
+	Timeout time.Duration
 }
 
 // Start launches llama-server and waits until /health reports ready.
@@ -121,10 +121,16 @@ type ChatMessage struct {
 }
 
 type chatRequest struct {
-	Messages    []ChatMessage `json:"messages"`
-	Temperature float64       `json:"temperature"`
-	MaxTokens   int           `json:"max_tokens"`
-	Stream      bool          `json:"stream"`
+	Messages       []ChatMessage   `json:"messages"`
+	Temperature    float64         `json:"temperature"`
+	MaxTokens      int             `json:"max_tokens"`
+	Stream         bool            `json:"stream"`
+	ResponseFormat *responseFormat `json:"response_format,omitempty"`
+}
+
+type responseFormat struct {
+	Type   string         `json:"type"`
+	Schema map[string]any `json:"schema,omitempty"`
 }
 
 type chatResponse struct {
@@ -140,47 +146,68 @@ type chatResponse struct {
 
 // Chat sends one chat completion and returns the assistant message.
 func (s *Server) Chat(ctx context.Context, messages []ChatMessage, temperature float64, maxTokens int) (string, error) {
+	return s.chat(ctx, messages, temperature, maxTokens, nil)
+}
+
+// ChatJSON asks llama-server to constrain the reply to a JSON schema. If the
+// server build does not support response_format, it retries without it.
+func (s *Server) ChatJSON(ctx context.Context, messages []ChatMessage, schema map[string]any, temperature float64, maxTokens int) (string, error) {
+	rf := &responseFormat{Type: "json_object", Schema: schema}
+	content, status, err := s.chatStatus(ctx, messages, temperature, maxTokens, rf)
+	if err != nil && status == 400 {
+		return s.Chat(ctx, messages, temperature, maxTokens)
+	}
+	return content, err
+}
+
+func (s *Server) chat(ctx context.Context, messages []ChatMessage, temperature float64, maxTokens int, rf *responseFormat) (string, error) {
+	content, _, err := s.chatStatus(ctx, messages, temperature, maxTokens, rf)
+	return content, err
+}
+
+func (s *Server) chatStatus(ctx context.Context, messages []ChatMessage, temperature float64, maxTokens int, rf *responseFormat) (string, int, error) {
 	body, err := json.Marshal(chatRequest{
-		Messages:    messages,
-		Temperature: temperature,
-		MaxTokens:   maxTokens,
+		Messages:       messages,
+		Temperature:    temperature,
+		MaxTokens:      maxTokens,
+		ResponseFormat: rf,
 	})
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", s.port)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", resp.StatusCode, err
 	}
 	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("chat http %d: %s", resp.StatusCode, truncate(string(data), 400))
+		return "", resp.StatusCode, fmt.Errorf("chat http %d: %s", resp.StatusCode, truncate(string(data), 400))
 	}
 
 	var cr chatResponse
 	if err := json.Unmarshal(data, &cr); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
+		return "", resp.StatusCode, fmt.Errorf("decode response: %w", err)
 	}
 	if cr.Error != nil {
-		return "", fmt.Errorf("server error: %s", cr.Error.Message)
+		return "", resp.StatusCode, fmt.Errorf("server error: %s", cr.Error.Message)
 	}
 	if len(cr.Choices) == 0 {
-		return "", fmt.Errorf("empty choices")
+		return "", resp.StatusCode, fmt.Errorf("empty choices")
 	}
-	return cr.Choices[0].Message.Content, nil
+	return cr.Choices[0].Message.Content, resp.StatusCode, nil
 }
 
 // Kill stops the server process.
