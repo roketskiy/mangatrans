@@ -39,7 +39,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	for i := 0; i < len(pages) && i < 5; i++ {
+	for i := 0; i < len(pages) && i < 8; i++ {
 		data, err := os.ReadFile(filepath.Join(os.Args[2], fmt.Sprintf("blocks%02d.json", i)))
 		if err != nil {
 			continue
@@ -64,7 +64,7 @@ func main() {
 				drawRect(out, r, color.RGBA{R: 230, A: 255})
 				fmt.Printf("p%02d %-24q text=%v bubble=%v\n", i, trunc(b.OCR), b.Box, r)
 			} else {
-				fmt.Printf("p%02d %-24q text=%v no bubble\n", i, trunc(b.OCR), b.Box)
+				fmt.Printf("p%02d %-24q text=%v no bubble (%s)\n", i, trunc(b.OCR), b.Box, f.Reason)
 			}
 		}
 		fmt.Printf("page %d: %d/%d fitted\n", i, found, len(blocks))

@@ -4,6 +4,7 @@
 package bubble
 
 import (
+	"fmt"
 	"image"
 	"image/color"
 )
@@ -14,6 +15,7 @@ type Finder struct {
 	labels []int32
 	parent []int32
 	stats  map[int32]stat
+	Reason string
 }
 
 type stat struct {
@@ -134,11 +136,11 @@ func (f *Finder) union(a, b int32) int32 {
 // text, not the page background, and not an enormous white area of artwork.
 func (f *Finder) Fit(textBox image.Rectangle) (image.Rectangle, bool) {
 	if f == nil || textBox.Empty() {
-		return image.Rectangle{}, false
+		return f.reject("empty")
 	}
 	textBox = textBox.Intersect(image.Rect(0, 0, f.W, f.H))
 	if textBox.Empty() {
-		return image.Rectangle{}, false
+		return f.reject("outside page")
 	}
 
 	counts := make(map[int32]int)
@@ -157,44 +159,42 @@ func (f *Finder) Fit(textBox image.Rectangle) (image.Rectangle, bool) {
 		}
 	}
 	if best < 0 {
-		return image.Rectangle{}, false
+		return f.reject("no white region")
 	}
 	s := f.stats[best]
 
 	// Reject the page background and very large artwork regions.
 	if s.rect.Min.X <= 2 || s.rect.Min.Y <= 2 || s.rect.Max.X >= f.W-2 || s.rect.Max.Y >= f.H-2 {
-		return image.Rectangle{}, false
-	}
-	if s.rect.Dx()*s.rect.Dy() > f.W*f.H/5 {
-		return image.Rectangle{}, false
+		return f.reject("touches page border")
 	}
 	// The text must sit inside the region, and the region must be bigger.
-	outer := s.rect.Inset(-2)
-	if textBox.Min.X < outer.Min.X || textBox.Min.Y < outer.Min.Y ||
-		textBox.Max.X > outer.Max.X || textBox.Max.Y > outer.Max.Y {
-		return image.Rectangle{}, false
-	}
-	if s.area < textBox.Dx()*textBox.Dy() {
-		return image.Rectangle{}, false
+	// A dense vertical block can cover most of the bubble, so allow the white
+	// area to be somewhat smaller than the OCR box.
+	if s.area*2 < textBox.Dx()*textBox.Dy() {
+		return f.reject(fmt.Sprintf("white area %d < half of box %d", s.area, textBox.Dx()*textBox.Dy()))
 	}
 	// A region far larger than the text is usually several bubbles merged by
 	// a shared white gap; expanding there would centre the text in the gutter.
 	tbArea := textBox.Dx() * textBox.Dy()
 	if s.rect.Dx()*s.rect.Dy() > 8*tbArea {
-		return image.Rectangle{}, false
+		return f.reject("region 8x larger than text")
 	}
 	if s.rect.Dx() > 5*textBox.Dx() || s.rect.Dy() > 5*textBox.Dy() {
-		return image.Rectangle{}, false
+		return f.reject("dimension ratio")
 	}
 	// Extremely elongated regions are usually panel gutters, not bubbles.
 	dx, dy := s.rect.Dx(), s.rect.Dy()
 	if dx > 6*dy || dy > 6*dx {
-		return image.Rectangle{}, false
+		return f.reject("elongated")
 	}
-	// Use the component bounding box. The largest all-white rectangle is not
-	// suitable: glyphs punch holes in the white region, so it would shrink to
-	// a thin empty margin and make the translation tiny.
+	f.Reason = "ok"
 	return s.rect.Inset(2), true
+}
+
+// reject records why a region was refused, for probes.
+func (f *Finder) reject(reason string) (image.Rectangle, bool) {
+	f.Reason = reason
+	return image.Rectangle{}, false
 }
 
 // Debug returns the region label under a point, for probes.

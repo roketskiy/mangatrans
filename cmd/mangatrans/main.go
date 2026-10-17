@@ -324,7 +324,7 @@ func main() {
 		finder := bubble.Find(pr.img, 210)
 		usedBubble := make(map[image.Rectangle]bool, len(active))
 		for k := range active {
-			if r, ok := finder.Fit(active[k].Box); ok && !usedBubble[r] && centered(active[k].Box, r) {
+			if r, ok := finder.Fit(active[k].Box); ok && !usedBubble[r] {
 				active[k].Anchor = r
 				usedBubble[r] = true
 			}
