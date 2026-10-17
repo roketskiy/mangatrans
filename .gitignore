@@ -1,0 +1,6 @@
+# Agent skills configuration
+.agents/
+skills-lock.json
+
+# Local tool checkout
+koharu-slim/
