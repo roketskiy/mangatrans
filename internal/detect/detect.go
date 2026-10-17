@@ -191,9 +191,41 @@ func (m *Model) postprocessYOLO(origW, origH int, layout infer.TensorLayout, p P
 	}
 
 	keep := infer.NMS(boxes, scores, p.NMSThreshold)
-	outBoxes := make([]infer.Rect, 0, len(keep))
-	outScores := make([]float32, 0, len(keep))
+
+	// A box almost entirely inside a larger one is a duplicate detection of
+	// the same bubble; NMS keeps it when the area ratio is low (a small box in
+	// a big one has low IoU). Left in, both get translated and drawn on top of
+	// each other.
+	filtered := make([]int, 0, len(keep))
 	for _, i := range keep {
+		a := boxes[i]
+		contained := false
+		for _, j := range keep {
+			if i == j {
+				continue
+			}
+			b := boxes[j]
+			if b.Area() <= a.Area() {
+				continue
+			}
+			x0, y0 := maxf(a.X, b.X), maxf(a.Y, b.Y)
+			x1, y1 := minf(a.X+a.W, b.X+b.W), minf(a.Y+a.H, b.Y+b.H)
+			if x1 <= x0 || y1 <= y0 {
+				continue
+			}
+			if (x1-x0)*(y1-y0) >= 0.7*a.Area() {
+				contained = true
+				break
+			}
+		}
+		if !contained {
+			filtered = append(filtered, i)
+		}
+	}
+
+	outBoxes := make([]infer.Rect, 0, len(filtered))
+	outScores := make([]float32, 0, len(filtered))
+	for _, i := range filtered {
 		outBoxes = append(outBoxes, boxes[i])
 		outScores = append(outScores, scores[i])
 	}
@@ -401,4 +433,18 @@ func erodeRowsT(src []uint8, w, h, r int) []uint8 {
 		}
 	}
 	return dst
+}
+
+func maxf(a, b float32) float32 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minf(a, b float32) float32 {
+	if a < b {
+		return a
+	}
+	return b
 }

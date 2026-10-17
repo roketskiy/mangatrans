@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"mangatrans/internal/bubble"
 	"mangatrans/internal/cbz"
 	"mangatrans/internal/detect"
 	"mangatrans/internal/infer"
@@ -41,6 +42,7 @@ func main() {
 	conf := flag.Float64("conf", 0.35, "detection confidence threshold")
 	mtModel := flag.String("mt-model", `E:\work\transl\models\Hy-MT2-1.8B-UD-Q4_K_XL.gguf`, "translation gguf")
 	fontPath := flag.String("font", `C:\Windows\Fonts\msyhbd.ttc`, "font file for translations")
+	glossaryPath := flag.String("glossary", "", "term glossary: JSON map or source=target lines")
 	flag.Parse()
 	if *in == "" || *out == "" {
 		log.Fatal("usage: mangatrans -in book.cbz -out book.zh.cbz [-work dir] [-limit N]")
@@ -166,7 +168,16 @@ func main() {
 	}
 	defer mtSrv.Kill()
 
-	tr := translate.New(mtSrv)
+	var glossary map[string]string
+	if *glossaryPath != "" {
+		glossary, err = translate.LoadGlossary(*glossaryPath)
+		if err != nil {
+			log.Fatalf("load glossary: %v", err)
+		}
+		log.Printf("glossary: %d terms", len(glossary))
+	}
+
+	tr := translate.New(mtSrv, glossary)
 	const perBatch = 12
 	mtStart := time.Now()
 	for _, pr := range results {
@@ -193,6 +204,28 @@ func main() {
 			}
 		}
 	}
+	// Single-line retry for blocks the batch model left empty. Name lists and
+	// lines that begin with ellipses often trigger an empty string, and
+	// keeping the Japanese there is worse than one extra request.
+	retries := 0
+	for _, pr := range results {
+		for k := range pr.blocks {
+			if pr.blocks[k].Text != "" {
+				continue
+			}
+			txt, err := tr.TranslateOne(ctx, pr.ocr[k])
+			if err != nil {
+				log.Printf("page %d block %d: single retry failed: %v", pr.index, k+1, err)
+				continue
+			}
+			if txt != "" && txt != pr.ocr[k] {
+				pr.blocks[k].Text = txt
+				retries++
+			}
+		}
+	}
+	log.Printf("single-line retries: %d", retries)
+
 	log.Printf("translation done in %s", time.Since(mtStart).Round(time.Second))
 	for _, pr := range results {
 		n := 0
@@ -246,7 +279,16 @@ func main() {
 			outPages = append(outPages, pg)
 			continue
 		}
+		// Lay the translation out in the speech bubble rather than the tight
+		// OCR box. This keeps longer text inside the outline and lets the font
+		// grow to the bubble's real size.
+		finder := bubble.Find(pr.img, 210)
+		usedBubble := make(map[image.Rectangle]bool, len(active))
 		for k := range active {
+			if r, ok := finder.Fit(active[k].Box); ok && !usedBubble[r] {
+				active[k].Box = r
+				usedBubble[r] = true
+			}
 			active[k].TextColor = textColor(pr.img, active[k].Box)
 		}
 		mask := restrictMask(pr.mask, active)

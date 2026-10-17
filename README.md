@@ -8,7 +8,7 @@
 2. **OCR**：PaddleOCR-VL-For-Manga（GGUF，llama.cpp）逐框识别，保留竖排和拟声词。
 3. **翻译**：Hy-MT2-1.8B（GGUF，llama.cpp）按页批量翻译，JSON schema 约束输出；缺失的 id 单独重试，仍失败就保留原文。
 4. **擦字**：LaMa（ONNX）按连通域分窗修补；纯色气泡走快速填充，不跑模型。
-5. **排版**：tdewolff/canvas 逐框渲染。竖排用 `VerticalRL + Upright`，自动选字号、按字数折列、避头尾标点，并按背景明暗自动选黑/白字。
+5. **排版**：先用连通域找出气泡内部，把文字排进气泡而不是 OCR 的紧框；再用 tdewolff/canvas 逐框渲染。竖排用 `VerticalRL + Upright`，自动选字号、按字数折列、避头尾标点，并按背景明暗自动选黑/白字。
 6. **打包**：保持原文件名和顺序写回 CBZ。
 
 OCR 和翻译串行使用 GPU：OCR 模型先卸载，再加载翻译模型。
@@ -73,10 +73,31 @@ go build -o bin\mangatrans.exe .\cmd\mangatrans
 | `-conf 0.35` | 检测置信度阈值 |
 | `-mt-model PATH` | 翻译 GGUF |
 | `-font PATH` | 译文字体，默认 `msyhbd.ttc` |
+| `-glossary PATH` | 术语表，JSON 映射或每行 `原文=译文` |
 
 环境变量（都可选）：
 
 `MANGATRANS_LLAMA`、`MANGATRANS_OCR_MODEL`、`MANGATRANS_MMPROJ`、`MANGATRANS_DET_MODEL`、`MANGATRANS_LAMA_MODEL`、`MANGATRANS_ORT_DIR`、`MANGATRANS_CUDA_DIR`
+
+术语表示例：
+
+```powershell
+.\bin\mangatrans.exe -in book.cbz -out book.zh.cbz -glossary glossary.example.json
+```
+
+只把当前批次里出现的词条注入提示词，不会拖慢其他页。
+
+## 桌面界面
+
+`mangatrans-ui.exe` 是 MyGo 写的原生窗口，只负责选文件、显示进度和日志；翻译仍由同目录的 `mangatrans.exe` 完成。
+
+```powershell
+.\build.ps1       # 先构建引擎
+.\build-ui.ps1    # 再构建界面
+.\bin\mangatrans-ui.exe
+```
+
+界面构建需要 Go 1.27（脚本使用 `.cache\go1.27`），引擎仍用 Go 1.26 + cgo。两个 exe 必须放在同一目录，或者用 `MANGATRANS_EXE` 指向引擎。
 
 ## 实测
 

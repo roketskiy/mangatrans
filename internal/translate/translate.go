@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -45,11 +47,15 @@ const systemPrompt = `你是一个专业的日文漫画翻译，把日文对白�
 
 // Client translates batches of blocks through a llama-server.
 type Client struct {
-	srv *llm.Server
+	srv      *llm.Server
+	glossary map[string]string
 }
 
-// New wraps a running llama-server.
-func New(srv *llm.Server) *Client { return &Client{srv: srv} }
+// New wraps a running llama-server. glossary maps source terms to the exact
+// Chinese wording the translation must use; it may be nil.
+func New(srv *llm.Server, glossary map[string]string) *Client {
+	return &Client{srv: srv, glossary: glossary}
+}
 
 // TranslateBatch sends one batch and parses the JSON reply. Blocks the model
 // fails to return are retried once on their own; anything still missing is
@@ -74,7 +80,7 @@ func (c *Client) TranslateBatch(ctx context.Context, blocks []Block) (Result, er
 		}
 		msgs := []llm.ChatMessage{
 			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: string(payload)},
+			{Role: "user", Content: withGlossary(string(payload), pending, c.glossary)},
 		}
 		content, err := c.srv.ChatJSON(ctx, msgs, batchSchema, 0.0, 4096)
 		if err != nil {
@@ -99,7 +105,90 @@ func (c *Client) TranslateBatch(ctx context.Context, blocks []Block) (Result, er
 	return result, nil
 }
 
+// TranslateOne translates a single line with the model's plain translation
+// template. It is the fallback for blocks that came back empty from the JSON
+// batch, which happens with name lists and lines that start with ellipses.
+func (c *Client) TranslateOne(ctx context.Context, text string) (string, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", nil
+	}
+	msgs := []llm.ChatMessage{
+		{Role: "system", Content: "你是日文漫画翻译。把用户给的一行日文翻译成简体中文，只输出译文本身，不要解释，不要引号。"},
+		{Role: "user", Content: text},
+	}
+	out, err := c.srv.Chat(ctx, msgs, 0.0, 256)
+	if err != nil {
+		return "", err
+	}
+	return cleanOne(out), nil
+}
+
+func cleanOne(s string) string {
+	s = strings.TrimSpace(s)
+	for _, p := range []string{"译文：", "翻译：", "中文："} {
+		s = strings.TrimPrefix(s, p)
+	}
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "\"“”「」『』")
+	return strings.TrimSpace(s)
+}
+
 var trailingComma = regexp.MustCompile(`,\s*([}\]])`)
+
+// LoadGlossary reads a JSON object {"source":"target"} or a text file with one
+// "source=target" pair per line. Blank lines and # comments are ignored.
+func LoadGlossary(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err == nil {
+		return m, nil
+	}
+	m = make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "\ufeff"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		src, dst, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		src, dst = strings.TrimSpace(src), strings.TrimSpace(dst)
+		if src != "" && dst != "" {
+			m[src] = dst
+		}
+	}
+	return m, nil
+}
+
+// withGlossary prepends the entries that occur in this batch. Only relevant
+// terms are sent, so the prompt stays short and the model is not distracted by
+// names from another scene.
+func withGlossary(payload string, blocks []Block, g map[string]string) string {
+	if len(g) == 0 {
+		return payload
+	}
+	var joined strings.Builder
+	for _, b := range blocks {
+		joined.WriteString(b.Text)
+	}
+	src := joined.String()
+	var pairs []string
+	for from, to := range g {
+		if strings.Contains(src, from) {
+			pairs = append(pairs, from+" => "+to)
+		}
+	}
+	if len(pairs) == 0 {
+		return payload
+	}
+	sort.Strings(pairs)
+	return "术语表（以下译名必须原样使用）：\n" + strings.Join(pairs, "\n") + "\n\n" + payload
+}
 
 // batchSchema lets llama-server constrain generation to the reply shape. It
 // cannot force every id to appear, so parseLoose still validates the result.
