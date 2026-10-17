@@ -15,7 +15,7 @@ if (-not (Test-Path (Join-Path $root 'bin\mangatrans.exe'))) {
 $env:CGO_ENABLED = '0'
 Push-Location $src
 try {
-    & $go build -o (Join-Path $root 'bin\mangatrans-ui.exe') .
+    & $go build -ldflags '-H=windowsgui' -o (Join-Path $root 'bin\mangatrans-ui.exe') .
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     Write-Output ('built ' + (Join-Path $root 'bin\mangatrans-ui.exe'))
 } finally {

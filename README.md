@@ -98,29 +98,48 @@ go build -o bin\mangatrans.exe .\cmd\mangatrans
 .\bin\mangatrans-ui.exe
 ```
 
+界面按 Windows GUI 子系统构建（`-ldflags '-H=windowsgui'`），启动时不会创建控制台。引擎和它拉起的 `llama-server.exe` 都使用 `CREATE_NO_WINDOW`；点“停止”或关闭窗口时会取消任务，并用 `taskkill /PID <pid> /T /F` 清理整棵进程树。`.\test-shutdown.ps1` 会启动一次引擎、等到 `llama-server` 子进程出现，再执行同样的清理并检查残留。
+
+UI 还创建带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object，并把引擎加入该 job。即使从任务管理器强制结束 UI，Windows 关闭 job handle 时也会连带结束引擎和 `llama-server`。`.\bin\mangatrans-ui.exe -job-selftest` 会做一次隐藏的进程树测试，结果写到 `.cache\out\job-selftest.json`。
+
 界面构建需要 Go 1.27（脚本使用 `.cache\go1.27`），引擎仍用 Go 1.26 + cgo。两个 exe 必须放在同一目录，或者用 `MANGATRANS_EXE` 指向引擎。
 
 ## 性能基准
 
-整本 11 页（822x1200），CUDA 13，Hy-MT2-1.8B Q4：
+整本 11 页（822x1200），CUDA 13，RTX 4050 Laptop 6GB，Hy-MT2-1.8B Q4。下表是热启动运行（第二轮，系统和显存已预热）：
 
 | 阶段 | 耗时 | 吞吐 |
 | --- | --- | --- |
-| 检测 | 1.79 s | 162 ms/页 |
-| OCR | 8.79 s | 141 ms/框，7.1 框/s |
-| 翻译 | 8.79 s | 141 ms/块，7.1 块/s |
-| 擦字 | 14.30 s | 1.30 s/页 |
-| 排版 | 0.61 s | 55 ms/页 |
-| 模型加载 | 13.4 s | 一次性 |
-| 总计 | 48.7 s | 4.43 s/页，13.6 页/分钟 |
+| 检测 | 1.76 s | 160 ms/页 |
+| OCR | 8.44 s | 136 ms/框，7.3 框/s |
+| 翻译 | 9.28 s | 150 ms/块，6.7 块/s |
+| 擦字 | 13.33 s | 1.21 s/页 |
+| 排版 | 0.70 s | 63 ms/页 |
+| 模型加载 | 15.35 s | 一次性 |
+| 总计 | 50.1 s | 4.55 s/页，13.2 页/分钟 |
 
-同一台机器上不同次运行会有约 ±10% 的波动。写完输出后会回读 CBZ 并逐页解码，日志里会打印 `validate output: ... all decode`。
+冷启动同一本约 61.5 秒（5.59 秒/页）；差异主要来自模型加载和后台 GPU 占用。不同次运行约 ±10%。
+
+### 资源占用（同一轮热启动）
+
+| 项目 | 峰值 |
+| --- | --- |
+| 引擎进程 RSS | 1.56 GB |
+| llama-server RSS | 1.59 GB |
+| 合计 RSS | 3.15 GB |
+| 显存 | 5.18 GB / 6.14 GB |
+| GPU 利用率 | 94% |
+| CPU | 43.1 CPU 秒，约 0.85 核 |
+
+显存余量约 1 GB；同时开浏览器或其他 GPU 应用会拖慢，甚至 OOM。以上只统计翻译后端；UI 是 GUI 外壳，没有启动测量。
 
 `.\bench.ps1` 会重跑这本测试书，并在输出 CBZ 旁写一份 `bench.json`，字段是各阶段毫秒数、页数、框数和字数。
 
+`.\bench-resource.ps1` 会无窗口启动引擎，同时记录阶段耗时、峰值 RSS、显存、GPU 利用率、CPU 时间；结果写到输出 CBZ 旁的 `.resources.json`。用 `-Out` 指定另一份输出即可重复跑。
+
 ## 实测
 
-测试书 1：`11歳になってしまう`，11 页 822x1200。62 个文本框，约 49 秒。
+测试书 1：`11歳になってしまう`，11 页 822x1200。62 个文本框，热启动约 50 秒。
 测试书 2：`『刀剣乱舞-花丸-』第2話`，34 页，约 2 分钟。
 测试书 3：`勇者ご一行の帰り道`，53 页，302 个文本框，3386 字，3 分 32 秒（3.99 秒/页）。
 

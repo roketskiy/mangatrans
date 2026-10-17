@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -20,6 +22,7 @@ type Server struct {
 	exe      string
 	logFile  string
 	logBuf   *bytes.Buffer
+	stopOnce sync.Once
 	Shutdown func()
 }
 
@@ -61,6 +64,10 @@ func Start(ctx context.Context, c Config) (*Server, error) {
 	}
 
 	cmd := exec.CommandContext(ctx, c.Exe, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
@@ -70,10 +77,13 @@ func Start(ctx context.Context, c Config) (*Server, error) {
 
 	s := &Server{cmd: cmd, port: port, exe: c.Exe, logFile: c.LogPath}
 	s.Shutdown = func() {
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-		}
-		logFile.Close()
+		s.stopOnce.Do(func() {
+			if cmd.Process != nil {
+				cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}
+			logFile.Close()
+		})
 	}
 
 	if err := s.waitReady(ctx, c.Timeout); err != nil {
