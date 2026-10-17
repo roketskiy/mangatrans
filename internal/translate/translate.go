@@ -90,10 +90,13 @@ func (c *Client) TranslateBatch(ctx context.Context, blocks []Block) (Result, er
 		next := pending[:0]
 		for _, b := range pending {
 			if txt, ok := got[b.ID]; ok {
-				result[b.ID] = txt
-			} else {
-				next = append(next, b)
+				txt = cleanOne(txt)
+				if !Untranslated(b.Text, txt) {
+					result[b.ID] = txt
+					continue
+				}
 			}
+			next = append(next, b)
 		}
 		pending = next
 		lastErr = fmt.Errorf("reply missing %d of %d ids", len(pending), len(blocks))
@@ -121,7 +124,11 @@ func (c *Client) TranslateOne(ctx context.Context, text string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	return cleanOne(out), nil
+	out = cleanOne(out)
+	if Untranslated(text, out) {
+		return "", nil
+	}
+	return out, nil
 }
 
 func cleanOne(s string) string {
@@ -132,6 +139,24 @@ func cleanOne(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.Trim(s, "\"“”「」『』")
 	return strings.TrimSpace(s)
+}
+
+// Untranslated rejects replies that are empty, unchanged, or still contain
+// kana. A small model occasionally copies Japanese into the "translation";
+// drawing that over the erased source is worse than keeping the original
+// page untouched, so the caller treats these blocks as missing.
+func Untranslated(src, dst string) bool {
+	dst = strings.TrimSpace(dst)
+	if dst == "" || dst == strings.TrimSpace(src) {
+		return true
+	}
+	for _, r := range dst {
+		if (r >= 0x3040 && r <= 0x30ff) || (r >= 0x31f0 && r <= 0x31ff) ||
+			(r >= 0xff66 && r <= 0xff9d) {
+			return true
+		}
+	}
+	return false
 }
 
 var trailingComma = regexp.MustCompile(`,\s*([}\]])`)

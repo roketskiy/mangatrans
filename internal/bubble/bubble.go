@@ -135,7 +135,10 @@ func (f *Finder) union(a, b int32) int32 {
 // regions that look like a speech bubble: enclosed by ink, larger than the
 // text, not the page background, and not an enormous white area of artwork.
 func (f *Finder) Fit(textBox image.Rectangle) (image.Rectangle, bool) {
-	if f == nil || textBox.Empty() {
+	if f == nil {
+		return image.Rectangle{}, false
+	}
+	if textBox.Empty() {
 		return f.reject("empty")
 	}
 	textBox = textBox.Intersect(image.Rect(0, 0, f.W, f.H))

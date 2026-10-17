@@ -10,7 +10,9 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"os"
+	"strings"
 
 	"mangatrans/internal/llm"
 	"mangatrans/internal/render"
@@ -66,6 +68,19 @@ func cropRect(src image.Image, x, y, w, h float32, pad int) image.Image {
 	return dst
 }
 
+// cleanOCR removes the wrappers a vision model occasionally adds. The model
+// is asked for the text alone; a stray label or code fence must not become
+// part of the translation or the mask.
+func cleanOCR(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "`")
+	for _, p := range []string{"OCR:", "OCR：", "文字：", "文本：", "识别结果："} {
+		s = strings.TrimSpace(strings.TrimPrefix(s, p))
+	}
+	s = strings.ReplaceAll(s, "\r", "")
+	return strings.TrimSpace(s)
+}
+
 // ocrBox asks the OCR model to read one cropped region.
 func ocrBox(ctx context.Context, srv *llm.Server, crop image.Image) (string, error) {
 	var buf bytes.Buffer
@@ -96,9 +111,15 @@ func restrictMask(full *image.Gray, blocks []render.Block) *image.Gray {
 	out := image.NewGray(b)
 	for _, blk := range blocks {
 		r := blk.Box.Inset(-8).Intersect(b)
+		if r.Empty() {
+			continue
+		}
 		for y := r.Min.Y; y < r.Max.Y; y++ {
-			off := y * full.Stride
-			copy(out.Pix[off+r.Min.X:off+r.Max.X], full.Pix[off+r.Min.X:off+r.Max.X])
+			// PixOffset respects a non-zero image origin and stride. The old
+			// y*Stride arithmetic silently assumed both were zero.
+			src := full.PixOffset(r.Min.X, y)
+			dst := out.PixOffset(r.Min.X, y)
+			copy(out.Pix[dst:dst+r.Dx()], full.Pix[src:src+r.Dx()])
 		}
 	}
 	return out
@@ -157,6 +178,40 @@ func writeBlocks(path string, blocks []blockDump) {
 		return
 	}
 	os.WriteFile(path, data, 0o644)
+}
+
+// readTail returns the last maxLines lines of a text file, reading at most the
+// final 32 KiB. It is used only on the error path to show a server log before
+// the run directory is removed.
+func readTail(path string, maxLines int) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	const maxBytes = 32 << 10
+	if st.Size() > maxBytes {
+		if _, err := f.Seek(-maxBytes, io.SeekEnd); err != nil {
+			return ""
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes))
+	if err != nil {
+		return ""
+	}
+	text := strings.TrimRight(string(data), "\r\n")
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func writePNG(path string, img image.Image) {

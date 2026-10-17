@@ -10,14 +10,11 @@ import (
 	"mangatrans/internal/llm"
 )
 
-func TestParseBlocks(t *testing.T) {
-	blocks := []Block{{ID: 1, Text: "a"}, {ID: 2, Text: "b"}}
-
+func TestParseLoose(t *testing.T) {
 	cases := []struct {
 		name    string
 		content string
 		want    Result
-		wantErr bool
 	}{
 		{
 			name:    "plain json",
@@ -37,31 +34,22 @@ func TestParseBlocks(t *testing.T) {
 		{
 			name:    "missing id",
 			content: `{"blocks":[{"id":1,"text":"甲"}]}`,
-			wantErr: true,
+			want:    Result{1: "甲"},
 		},
 		{
 			name:    "no json",
 			content: `抱歉我不会`,
-			wantErr: true,
+			want:    Result{},
 		},
 		{
-			name:    "extra unknown id ignored",
+			name:    "extra unknown id kept",
 			content: `{"blocks":[{"id":1,"text":"甲"},{"id":2,"text":"乙"},{"id":9,"text":"多"}]}`,
-			want:    Result{1: "甲", 2: "乙"},
+			want:    Result{1: "甲", 2: "乙", 9: "多"},
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := parseBlocks(c.content, blocks)
-			if c.wantErr {
-				if err == nil {
-					t.Fatalf("expected error, got %v", got)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
+			got := parseLoose(c.content)
 			if len(got) != len(c.want) {
 				t.Fatalf("got %v want %v", got, c.want)
 			}
@@ -77,8 +65,11 @@ func TestParseBlocks(t *testing.T) {
 // TestTranslateBatchLive exercises a real llama-server when the model is
 // present. Skipped otherwise so CI stays green.
 func TestTranslateBatchLive(t *testing.T) {
+	if os.Getenv("MANGATRANS_LIVE_TEST") == "" {
+		t.Skip("set MANGATRANS_LIVE_TEST=1 to run the live model test")
+	}
 	exe := `C:\Users\Public\Temp\opencode\llamacpp\llama\llama-server.exe`
-	model := `E:\work\transl\models\Hy-MT2-1.8B-UD-Q3_K_XL.gguf`
+	model := `E:\work\transl\models\Hy-MT2-1.8B-UD-Q4_K_XL.gguf`
 	if _, err := os.Stat(exe); err != nil {
 		t.Skip("llama-server not found")
 	}
@@ -106,7 +97,7 @@ func TestTranslateBatchLive(t *testing.T) {
 		{ID: 2, Text: "うん"},
 		{ID: 3, Text: "……"},
 	}
-	got, err := New(srv).TranslateBatch(ctx, blocks)
+	got, err := New(srv, nil).TranslateBatch(ctx, blocks)
 	if err != nil {
 		t.Fatal(err)
 	}

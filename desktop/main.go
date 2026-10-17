@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,18 +24,24 @@ import (
 )
 
 type app struct {
-	mu       sync.Mutex
-	win      *mygo.Window
-	input    string
-	output   string
-	busy     bool
-	status   string
-	progress float64
-	done     int
-	log      []string
-	cancel   context.CancelFunc
-	cmd      *exec.Cmd
-	total    int
+	mu        sync.Mutex
+	win       *mygo.Window
+	input     string
+	output    string
+	busy      bool
+	status    string
+	progress  float64
+	done      int
+	total     int
+	stage     int
+	failed    bool
+	lastErr   string
+	log       []string
+	logDirty  bool
+	logFollow bool
+	logView   ui.ScrollState
+	cancel    context.CancelFunc
+	cmd       *exec.Cmd
 }
 
 func main() {
@@ -50,10 +57,10 @@ func main() {
 	mygo.App.WhenReady(func() {
 		a.win = mygo.NewWindow(mygo.WindowOptions{
 			Title:           "漫画翻译器",
-			Width:           1000,
-			Height:          720,
-			MinWidth:        900,
-			MinHeight:       640,
+			Width:           1040,
+			Height:          740,
+			MinWidth:        920,
+			MinHeight:       660,
 			TitleBarStyle:   mygo.TitleBarHidden,
 			TitleBarHeight:  52,
 			BackgroundColor: "#F4F4F5",
@@ -91,8 +98,26 @@ func (a *app) view(c *ui.Context) {
 	progress := a.progress
 	done := a.done
 	total := a.total
+	stage := a.stage
+	failed := a.failed
+	lastErr := a.lastErr
 	lines := append([]string(nil), a.log...)
+	dirty := a.logDirty
+	a.logDirty = false
 	a.mu.Unlock()
+
+	if a.logView.MaxY > 0 && a.logView.Y+32 < a.logView.MaxY {
+		// The reader scrolled up to inspect an earlier line. Stop following
+		// until they return to the bottom.
+		a.logFollow = false
+	} else if a.logView.Y >= a.logView.MaxY {
+		// Back at the end: new lines follow again.
+		a.logFollow = true
+	}
+	if dirty && (a.logFollow || a.logView.MaxY == 0) {
+		a.logView.Y = math.MaxFloat32
+		a.logView.X = 0
+	}
 
 	if busy {
 		over = false
@@ -100,6 +125,9 @@ func (a *app) view(c *ui.Context) {
 		a.acceptFiles(dropped)
 		a.mu.Lock()
 		status = a.status
+		stage = a.stage
+		failed = a.failed
+		lastErr = a.lastErr
 		a.mu.Unlock()
 	}
 
@@ -113,8 +141,8 @@ func (a *app) view(c *ui.Context) {
 		a.topBar(c, headerH, bar.Right)
 		ui.Row(c).Fill().Background(appBg).Padding(20).Gap(20).
 			AlignItems(ui.Stretch).Children(func() {
-			a.settingsCard(c, over, busy, status, progress, done, total)
-			a.logCard(c, lines, busy)
+			a.settingsCard(c, over, busy, status, progress, done, total, stage, failed, lastErr)
+			a.logCard(c, lines, busy, failed)
 		})
 	})
 }
@@ -132,18 +160,21 @@ func (a *app) topBar(c *ui.Context, height, right float32) {
 	ui.Row(c).Height(1).Background(line)
 }
 
-func (a *app) settingsCard(c *ui.Context, over, busy bool, status string, progress float64, done, total int) {
-	ui.Column(c).Grow(1).Background(surface).Border(1, line).Radius(16).
+func (a *app) settingsCard(c *ui.Context, over, busy bool, status string, progress float64, done, total, stage int, failed bool, lastErr string) {
+	ui.Column(c).Basis(560).Grow(3).Shrink(1).MinWidth(0).Background(surface).
+		Border(1, line).Radius(16).
 		Shadow(0, 8, 24, 0, ui.RGBA(20, 20, 24, 0.06)).
-		Padding(24).Gap(18).Children(func() {
+		Padding(24).Gap(16).Children(func() {
 		ui.Column(c).Gap(5).Children(func() {
 			ui.Text(c, "漫画翻译").FontSize(22).Bold().TextColor(ink)
 			ui.Text(c, "选择漫画和保存位置，然后开始翻译。").FontSize(13).
 				TextColor(muted).SingleLine()
 		})
 
-		a.dropZone(c, over)
-		a.outputField(c)
+		// The drop zone takes the free vertical space. The card never grows an
+		// awkward empty gap, and the file target stays the visual focus.
+		a.dropZone(c, over, busy)
+		a.outputField(c, busy)
 
 		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "翻译语言").Width(56).FontSize(11).TextColor(muted)
@@ -153,12 +184,12 @@ func (a *app) settingsCard(c *ui.Context, over, busy bool, status string, progre
 			})
 		})
 
-		ui.Spacer(c).Grow(1)
-		a.actionArea(c, busy, status, progress, done, total)
+		a.stageStrip(c, busy, stage, failed)
+		a.actionArea(c, busy, status, progress, done, total, failed, lastErr)
 	})
 }
 
-func (a *app) dropZone(c *ui.Context, over bool) {
+func (a *app) dropZone(c *ui.Context, over, busy bool) {
 	bg, border := ui.RGB(250, 250, 251), line
 	tagBg, tagBorder, tagColor := surface, line, muted
 	title, sub := "拖入 CBZ 或 ZIP", "或点击选择文件"
@@ -171,8 +202,8 @@ func (a *app) dropZone(c *ui.Context, over bool) {
 	if a.input != "" {
 		bg, border = peach, peachLn
 		tagBg, tagBorder, tagColor = surface, peachLn, accent
-		title = clip(filepath.Base(a.input), 44)
-		sub = clip(filepath.Dir(a.input), 60)
+		title = clip(filepath.Base(a.input), 30)
+		sub = clip(filepath.Dir(a.input), 46)
 		tag = strings.ToUpper(strings.TrimPrefix(filepath.Ext(a.input), "."))
 		if tag == "" {
 			tag = "CBZ"
@@ -193,8 +224,11 @@ func (a *app) dropZone(c *ui.Context, over bool) {
 		shadow = ui.RGBA(232, 106, 51, 0.12)
 	}
 
-	b := ui.Button(c, "").Height(250).Padding(0).Radius(12).
-		Background(bg).Border(1, border).Shadow(0, 1, 3, 0, shadow)
+	b := ui.Button(c, "").Grow(1).MinHeight(170).Padding(0).Radius(12).
+		Background(bg).Border(1, border).Shadow(0, 1, 3, 0, shadow).Disabled(busy)
+	if a.input != "" {
+		b.Tooltip(a.input)
+	}
 	b.Justify(ui.Center).AlignItems(ui.Center).Children(func() {
 		ui.Column(c).AlignItems(ui.Center).Gap(7).Children(func() {
 			ui.Column(c).Width(40).Height(40).Background(tagBg).Border(1, tagBorder).
@@ -214,14 +248,17 @@ func (a *app) dropZone(c *ui.Context, over bool) {
 	}
 }
 
-func (a *app) outputField(c *ui.Context) {
-	ui.Column(c).Gap(7).Children(func() {
+func (a *app) outputField(c *ui.Context, busy bool) {
+	ui.Column(c).Gap(7).MinWidth(0).Children(func() {
 		ui.Text(c, "保存位置").FontSize(11).TextColor(muted)
-		ui.Row(c).Background(surface).Border(1, line).Radius(10).
+		ui.Row(c).MinWidth(0).Background(surface).Border(1, line).Radius(10).
 			Shadow(0, 1, 2, 0, ui.RGBA(20, 20, 24, 0.03)).
 			Padding(5, 12).Gap(8).AlignItems(ui.Center).Children(func() {
-			ui.TextInput(c, &a.output).Grow(1).Background(surface).
-				Border(0, ui.Color{}).Placeholder("自动生成文件名")
+			ui.TextInput(c, &a.output).Grow(1).MinWidth(0).Background(surface).
+				Border(0, ui.Color{}).Placeholder("自动生成文件名").ReadOnly(busy)
+			if busy {
+				return
+			}
 			if strings.TrimSpace(a.output) != "" {
 				if ui.Button(c, "打开").Background(surface).Border(0, ui.Color{}).
 					Padding(2, 8).Clicked() {
@@ -236,28 +273,90 @@ func (a *app) outputField(c *ui.Context) {
 	})
 }
 
-func (a *app) actionArea(c *ui.Context, busy bool, status string, progress float64, done, total int) {
+// stageStrip is a compact view of the four pipeline stages. It answers the
+// question the bare progress bar cannot: what is happening now, and what is
+// still ahead. A failed stage turns red instead of leaving a misleading
+// nearly-full bar.
+func (a *app) stageStrip(c *ui.Context, busy bool, stage int, failed bool) {
+	labels := []string{"识别文字", "翻译", "擦除排版", "保存校验"}
+	ui.Row(c).MinWidth(0).Gap(6).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, "流程").Width(32).FontSize(10).TextColor(muted)
+		for i, label := range labels {
+			done := stage >= 5 || stage > i+1
+			active := (stage == i+1 || (stage == stageIdle && failed && i == 0)) && stage < 5
+			bg := ui.RGB(247, 247, 249)
+			border := innerLine
+			fg := ui.RGB(166, 166, 176)
+			switch {
+			case failed && active:
+				bg, border, fg = ui.RGB(253, 235, 232), ui.RGB(244, 199, 194), danger
+			case done:
+				bg, border, fg = ui.RGB(236, 249, 244), ui.RGB(201, 235, 223), ui.RGB(14, 122, 95)
+			case active:
+				bg, border, fg = peach, peachLn, peachText
+			}
+			ui.Row(c).Background(bg).Border(1, border).Radius(99).
+				Padding(3, 8).Children(func() {
+				ui.Text(c, label).FontSize(10).TextColor(fg)
+			})
+		}
+		if busy {
+			ui.Spacer(c).Grow(1)
+			ui.Text(c, "运行中").FontSize(10).TextColor(accent)
+		}
+	})
+}
+
+func (a *app) actionArea(c *ui.Context, busy bool, status string, progress float64, done, total int, failed bool, lastErr string) {
 	canStart := strings.TrimSpace(a.input) != ""
-	ui.Column(c).Gap(12).Children(func() {
+	barColor := accent
+	textColor := muted
+	switch {
+	case failed:
+		barColor, textColor = danger, danger
+	case strings.HasPrefix(status, "翻译完成"):
+		barColor, textColor = ok, ui.RGB(14, 122, 95)
+	case strings.HasPrefix(status, "已取消"):
+		barColor, textColor = warn, warn
+	}
+
+	ui.Column(c).Gap(10).Children(func() {
+		if lastErr != "" {
+			tone, bg, border, label := danger, ui.RGB(253, 242, 240), ui.RGB(246, 214, 209), "失败原因"
+			if !failed {
+				tone, bg, border, label = warn, ui.RGB(255, 249, 238), ui.RGB(244, 224, 188), "注意"
+			}
+			ui.Row(c).FillWidth().Background(bg).Border(1, border).Radius(8).
+				Padding(7, 9).Children(func() {
+				ui.Text(c, label+"："+clip(lastErr, 120)).FontSize(10).
+					TextColor(tone)
+			})
+		}
 		ui.Row(c).Height(4).Background(ui.RGB(238, 238, 241)).Radius(2).
 			Children(func() {
 				if progress > 0 {
 					ui.Row(c).WidthPercent(float32(progress * 100)).Height(4).
-						Background(accent).Radius(2)
+						Background(barColor).Radius(2)
 				}
 			})
-		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "●").FontSize(9).TextColor(statusDot(status, busy))
-			ui.Text(c, status).FontSize(11).TextColor(muted).SingleLine()
+		ui.Row(c).MinWidth(0).Gap(10).AlignItems(ui.Center).Children(func() {
+			dot := statusDot(status, busy)
+			if failed {
+				dot = danger
+			}
+			ui.Text(c, "●").FontSize(9).TextColor(dot)
+			ui.Text(c, status).FontSize(11).TextColor(textColor).SingleLine()
 			ui.Spacer(c).Grow(1)
 			if total > 0 {
 				ui.Text(c, fmt.Sprintf("%d / %d 页", done, total)).FontSize(11).TextColor(muted)
 			}
 			if busy || progress > 0 {
-				ui.Text(c, fmt.Sprintf("%d%%", int(progress*100))).FontSize(11).TextColor(muted)
+				ui.Text(c, fmt.Sprintf("%d%%", int(progress*100))).FontSize(11).TextColor(textColor)
+			} else if failed {
+				ui.Text(c, "失败").FontSize(11).TextColor(danger)
 			}
 			if busy {
-				if ui.Button(c, "停止").Height(36).Padding(0, 18).Clicked() {
+				if ui.Button(c, "停止").Height(36).Padding(0, 18).Shrink(0).Clicked() {
 					a.stop()
 				}
 				return
@@ -265,8 +364,12 @@ func (a *app) actionArea(c *ui.Context, busy bool, status string, progress float
 			label := "开始翻译"
 			if !canStart {
 				label = "选择漫画"
+			} else if failed {
+				label = "重试"
+			} else if strings.HasPrefix(status, "翻译完成") {
+				label = "再次翻译"
 			}
-			if ui.PrimaryButton(c, label).Height(36).Padding(0, 18).
+			if ui.PrimaryButton(c, label).Height(36).Padding(0, 18).Shrink(0).
 				Shadow(0, 3, 10, 0, ui.RGBA(232, 106, 51, 0.24)).
 				Clicked() {
 				if canStart {
@@ -279,15 +382,24 @@ func (a *app) actionArea(c *ui.Context, busy bool, status string, progress float
 	})
 }
 
-func (a *app) logCard(c *ui.Context, lines []string, busy bool) {
-	ui.Column(c).Width(360).Background(surface).Border(1, line).Radius(16).
+func (a *app) logCard(c *ui.Context, lines []string, busy, failed bool) {
+	ui.Column(c).Basis(300).Grow(1).Shrink(1).MaxWidth(430).MinWidth(0).
+		Background(surface).Border(1, line).Radius(16).
 		Shadow(0, 8, 24, 0, ui.RGBA(20, 20, 24, 0.06)).Children(func() {
 		ui.Row(c).Padding(20, 20, 14, 20).Gap(8).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "运行日志").FontSize(12).Bold().TextColor(ink)
+			if failed {
+				ui.Row(c).Background(ui.RGB(253, 235, 232)).Border(1, ui.RGB(244, 199, 194)).
+					Radius(99).Padding(2, 7).Children(func() {
+					ui.Text(c, "失败").FontSize(9).TextColor(danger)
+				})
+			}
 			ui.Spacer(c).Grow(1)
 			meta := "就绪"
 			if len(lines) > 0 {
 				meta = fmt.Sprintf("%d 行", len(lines))
+			} else if failed {
+				meta = "失败"
 			}
 			ui.Text(c, meta).FontSize(10).TextColor(muted)
 		})
@@ -301,6 +413,9 @@ func (a *app) logCard(c *ui.Context, lines []string, busy bool) {
 				if busy {
 					text = "正在启动…"
 					sub = "请稍候。"
+				} else if failed {
+					text = "没有日志输出"
+					sub = "请查看左侧的失败原因。"
 				}
 				inner.AlignItems(ui.Center).Justify(ui.Center).Gap(5).Children(func() {
 					ui.Text(c, text).FontSize(12).TextColor(muted)
@@ -309,18 +424,42 @@ func (a *app) logCard(c *ui.Context, lines []string, busy bool) {
 				return
 			}
 			inner.Children(func() {
-				ui.Scroll(c).Grow(1).Children(func() {
-					ui.Column(c).Gap(3).Children(func() {
-						for _, line := range lines {
-							ui.Text(c, clip(line, 140)).FontSize(11).
-								Font("Cascadia Mono, Consolas, Microsoft YaHei, monospace").
-								TextColor(logText).SingleLine()
-						}
+				// ScrollBoth, not Scroll: the horizontal overflow belongs in
+				// the scroll range, so long paths and stack traces stay
+				// readable instead of being painted over the window edge.
+				ui.ScrollBoth(c).Grow(1).FillWidth().TrackScroll(&a.logView).
+					Children(func() {
+						ui.Column(c).FillWidth().Gap(4).Children(func() {
+							for _, line := range lines {
+								// Break at any character, as terminals do: log
+								// lines have no spaces to wrap at.
+								ui.Text(c, line).NoWrap().FontSize(10.5).
+									Font("Cascadia Mono, Consolas, Microsoft YaHei, monospace").
+									TextColor(logColor(line))
+							}
+						})
 					})
-				})
 			})
 		})
 	})
+}
+
+func logColor(line string) ui.Color {
+	switch {
+	case strings.HasPrefix(line, "panic:"),
+		strings.HasPrefix(line, "fatal:"),
+		strings.HasPrefix(line, "错误："),
+		strings.Contains(line, "failed"),
+		strings.Contains(line, "失败"),
+		strings.Contains(line, "do not decode"):
+		return danger
+	case strings.HasPrefix(line, "warning:"),
+		strings.HasPrefix(line, "警告："),
+		strings.Contains(line, "已取消"):
+		return warn
+	default:
+		return logText
+	}
 }
 
 var (
@@ -409,6 +548,12 @@ func fileSize(path string) string {
 }
 
 func (a *app) chooseFile() {
+	a.mu.Lock()
+	busy := a.busy
+	a.mu.Unlock()
+	if busy {
+		return
+	}
 	paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
 		Title:   "选择漫画文件",
 		Filters: []mygo.FileFilter{{Name: "漫画文件", Extensions: []string{"cbz", "zip"}}},
@@ -420,6 +565,12 @@ func (a *app) chooseFile() {
 }
 
 func (a *app) chooseSave() {
+	a.mu.Lock()
+	busy := a.busy
+	a.mu.Unlock()
+	if busy {
+		return
+	}
 	out, err := mygo.Dialog.Save(mygo.SaveDialogOptions{
 		Title:       "保存译文",
 		DefaultPath: a.output,
@@ -446,14 +597,21 @@ func (a *app) acceptFiles(paths []string) bool {
 		a.mu.Lock()
 		if !a.busy {
 			a.status = "只支持 CBZ 和 ZIP 文件。"
+			a.lastErr = a.status
+			a.failed = true
 		}
 		a.mu.Unlock()
+		a.invalidate()
 	}
 	return false
 }
 
 func (a *app) setInput(p string) {
 	a.mu.Lock()
+	if a.busy {
+		a.mu.Unlock()
+		return
+	}
 	oldDefault := ""
 	if a.input != "" {
 		oldDefault = defaultOutput(a.input)
@@ -462,9 +620,18 @@ func (a *app) setInput(p string) {
 	if a.output == "" || a.output == oldDefault {
 		a.output = defaultOutput(p)
 	}
-	if !a.busy {
-		a.status = "准备就绪。"
-	}
+	a.status = "准备就绪。"
+	a.stage = stageIdle
+	a.progress = 0
+	a.done = 0
+	a.total = 0
+	a.failed = false
+	a.lastErr = ""
+	a.log = nil
+	a.logDirty = true
+	a.logFollow = true
+	a.logView.X, a.logView.Y = 0, 0
+	a.logView.MaxX, a.logView.MaxY = 0, 0
 	a.mu.Unlock()
 	a.invalidate()
 }
@@ -475,40 +642,126 @@ func (a *app) start() {
 		a.mu.Unlock()
 		return
 	}
-	in, out := strings.TrimSpace(a.input), strings.TrimSpace(a.output)
-	if in == "" {
-		a.status = "先选择漫画文件。"
+	fail := func(msg string) {
+		a.status = msg
+		a.lastErr = msg
+		a.failed = true
 		a.mu.Unlock()
 		a.invalidate()
+	}
+	in, out := strings.TrimSpace(a.input), strings.TrimSpace(a.output)
+	if in == "" {
+		fail("先选择漫画文件。")
 		return
 	}
 	if out == "" {
 		out = defaultOutput(in)
-		a.output = out
 	}
-	engine := findEngine()
-	if engine == "" {
-		a.status = "找不到翻译引擎，请重新安装应用。"
-		a.mu.Unlock()
-		a.invalidate()
+	inAbs, err := filepath.Abs(in)
+	if err != nil {
+		fail("无法读取输入路径。")
 		return
 	}
+	outAbs, err := filepath.Abs(out)
+	if err != nil {
+		fail("无法读取保存路径。")
+		return
+	}
+	info, err := os.Stat(inAbs)
+	if err != nil || info.IsDir() {
+		fail("输入文件不存在或无法读取。")
+		return
+	}
+	ext := strings.ToLower(filepath.Ext(inAbs))
+	if ext != ".cbz" && ext != ".zip" {
+		fail("只支持 CBZ 和 ZIP 文件。")
+		return
+	}
+	if strings.EqualFold(filepath.Clean(inAbs), filepath.Clean(outAbs)) {
+		fail("保存路径不能和原文件相同。")
+		return
+	}
+	outExt := strings.ToLower(filepath.Ext(outAbs))
+	if outExt == "" {
+		outAbs += ".cbz"
+	} else if outExt != ".cbz" && outExt != ".zip" {
+		fail("保存文件请使用 .cbz 后缀。")
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(outAbs), 0o755); err != nil {
+		fail("无法创建保存目录。")
+		return
+	}
+	if st, err := os.Stat(outAbs); err == nil && st.IsDir() {
+		fail("保存路径是一个文件夹，请选择文件。")
+		return
+	}
+	// A forced kill can leave the atomic-write scratch file and the run log
+	// directory behind. The app runs one job at a time, so clear both before
+	// the next start. The engine repeats this defensively.
+	_ = os.Remove(outAbs + ".part")
+	_ = os.RemoveAll(filepath.Join(filepath.Dir(outAbs), "."+filepath.Base(outAbs)+".mangatrans"))
+	engine := findEngine()
+	if engine == "" {
+		fail("找不到翻译引擎，请重新安装应用。")
+		return
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	a.cancel = cancel
+	a.input, a.output = inAbs, outAbs
 	a.busy = true
 	a.cmd = nil
 	a.status = "正在启动…"
 	a.progress = 0
 	a.done = 0
 	a.total = 0
+	a.stage = stageIdle
+	a.failed = false
+	a.lastErr = ""
 	a.log = nil
+	a.logDirty = true
+	a.logFollow = true
+	a.logView.X, a.logView.Y = 0, 0
+	a.logView.MaxX, a.logView.MaxY = 0, 0
 	a.mu.Unlock()
 	a.invalidate()
 
-	go a.run(ctx, engine, in, out)
+	go a.run(ctx, engine, inAbs, outAbs)
 }
 
 func (a *app) stop() {
+	a.mu.Lock()
+	if !a.busy {
+		a.mu.Unlock()
+		return
+	}
+	parent := a.win
+	a.mu.Unlock()
+
+	// Do not hold the state lock while the native dialog runs: the UI still
+	// rebuilds behind it. Re-check busy afterwards in case the job finished.
+	res, err := mygo.Dialog.Message(mygo.MessageOptions{
+		Parent:        parent,
+		Type:          mygo.MessageWarning,
+		Title:         "停止翻译？",
+		Message:       "当前任务会立即结束，已经处理的内容不会保存。",
+		Buttons:       []string{"继续翻译", "停止"},
+		DefaultButton: 0,
+		CancelButton:  0,
+	})
+	if err != nil || res.Button != 1 {
+		return
+	}
+
+	a.mu.Lock()
+	if !a.busy {
+		a.mu.Unlock()
+		return
+	}
+	a.status = "正在停止…"
+	a.mu.Unlock()
+	a.invalidate()
 	a.shutdownBackend()
 }
 
@@ -559,6 +812,7 @@ func (a *app) run(ctx context.Context, engine, in, out string) {
 	}
 	if ctx.Err() != nil {
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		a.finish(context.Canceled)
 		return
 	}
@@ -570,6 +824,9 @@ func (a *app) run(ctx context.Context, engine, in, out string) {
 	for scanner.Scan() {
 		a.handleLine(scanner.Text())
 	}
+	if scanErr := scanner.Err(); scanErr != nil {
+		a.handleLine("warning: log read: " + scanErr.Error())
+	}
 	err = cmd.Wait()
 	if ctx.Err() != nil {
 		a.finish(context.Canceled)
@@ -578,10 +835,20 @@ func (a *app) run(ctx context.Context, engine, in, out string) {
 	a.finish(err)
 }
 
+const (
+	stageIdle      = 0
+	stageOCR       = 1
+	stageTranslate = 2
+	stageInpaint   = 3
+	stageSave      = 4
+	stageDone      = 5
+)
+
 var (
-	stampPrefix = regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} `)
-	pagesLine   = regexp.MustCompile(`^pages: (\d+)$`)
-	pageLine    = regexp.MustCompile(`^page (\d+):`)
+	stampPrefix  = regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} `)
+	pagesLine    = regexp.MustCompile(`^pages: (\d+)$`)
+	pageLine     = regexp.MustCompile(`^page (\d+):`)
+	progressLine = regexp.MustCompile(`^progress (ocr|translate|inpaint|save|done) (\d+)/(\d+)$`)
 )
 
 func (a *app) handleLine(raw string) {
@@ -589,38 +856,125 @@ func (a *app) handleLine(raw string) {
 	if line == "" {
 		return
 	}
+
+	// Machine-readable events drive the bar. Human log text is only displayed;
+	// the UI never guesses progress from English words in the log.
+	if m := progressLine.FindStringSubmatch(line); m != nil {
+		num, _ := strconv.Atoi(m[2])
+		den, _ := strconv.Atoi(m[3])
+		ratio := 0.0
+		if den > 0 {
+			ratio = float64(num) / float64(den)
+		}
+		a.mu.Lock()
+		if den > 0 {
+			a.total = den
+		}
+		a.done = num
+		switch m[1] {
+		case "ocr":
+			a.stage = stageOCR
+			a.progress = 0.03 + ratio*0.37
+			a.status = "正在识别文字…"
+		case "translate":
+			a.stage = stageTranslate
+			a.progress = 0.43 + ratio*0.25
+			a.status = "正在翻译…"
+		case "inpaint":
+			a.stage = stageInpaint
+			a.progress = 0.71 + ratio*0.25
+			if num > 0 {
+				a.status = "正在擦除与排版…"
+			}
+		case "save":
+			a.stage = stageSave
+			a.progress = 0.98
+			a.status = "正在保存…"
+		case "done":
+			a.stage = stageDone
+			a.progress = 1
+			a.status = "翻译完成。"
+		}
+		a.mu.Unlock()
+		a.invalidate()
+		return
+	}
+
 	a.mu.Lock()
 	switch {
 	case pagesLine.MatchString(line):
 		fmt.Sscanf(line, "pages: %d", &a.total)
+		a.done, a.stage, a.progress = 0, stageIdle, 0
+	case strings.HasPrefix(line, "panic:"),
+		strings.HasPrefix(line, "fatal:"),
+		strings.Contains(line, "failed"):
+		// These must come before pageLine: a failed page also starts with
+		// "page N:", and must not be mistaken for an OCR/translation update.
+		a.lastErr = line
 	case pageLine.MatchString(line):
-		var idx int
-		if _, err := fmt.Sscanf(line, "page %d:", &idx); err == nil && a.total > 0 {
-			a.done = idx + 1
-			a.progress = float64(idx+1) / float64(a.total) * 0.9
+		if strings.Contains(line, "translated") {
+			a.stage = stageTranslate
+			a.status = "正在翻译…"
+		} else {
+			a.stage = stageOCR
+			a.status = "正在识别文字…"
 		}
 	case strings.Contains(line, "starting OCR server"):
-		a.status = "正在识别文字…"
+		a.stage = stageOCR
+		a.status = "正在加载识别模型…"
+		if a.progress < 0.02 {
+			a.progress = 0.02
+		}
 	case strings.Contains(line, "OCR done"):
+		a.stage = stageTranslate
 		a.status = "正在翻译…"
+		if a.progress < 0.42 {
+			a.progress = 0.42
+		}
 	case strings.Contains(line, "starting translation server"):
-		a.status = "正在翻译…"
+		a.stage = stageTranslate
+		a.status = "正在加载翻译模型…"
+		if a.progress < 0.43 {
+			a.progress = 0.43
+		}
 	case strings.Contains(line, "translation done"):
-		a.status = "正在处理画面…"
-		a.progress = 0.92
+		a.stage = stageInpaint
+		a.status = "正在准备擦除模型…"
+		if a.progress < 0.70 {
+			a.progress = 0.70
+		}
 	case strings.Contains(line, "starting inpainting"):
-		a.status = "正在排版…"
+		a.stage = stageInpaint
+		a.status = "正在加载擦除模型…"
+		if a.progress < 0.71 {
+			a.progress = 0.71
+		}
 	case strings.Contains(line, "finish done"):
+		a.stage = stageSave
 		a.status = "正在保存…"
-		a.progress = 0.98
+		if a.progress < 0.97 {
+			a.progress = 0.97
+		}
 	case strings.HasPrefix(line, "wrote "):
-		a.status = "翻译完成。"
-		a.progress = 1
+		a.stage = stageSave
+		a.status = "正在校验输出…"
+		if a.progress < 0.98 {
+			a.progress = 0.98
+		}
+	case strings.Contains(line, "validate output:"):
+		if strings.Contains(line, "all decode") {
+			a.stage = stageDone
+			a.status = "翻译完成。"
+			a.progress = 1
+		} else {
+			a.lastErr = line
+		}
 	}
-	a.log = append(a.log, truncateLine(line, 220))
-	if len(a.log) > 300 {
-		a.log = a.log[len(a.log)-300:]
+	a.log = append(a.log, truncateLine(line, 600))
+	if len(a.log) > 500 {
+		a.log = a.log[len(a.log)-500:]
 	}
+	a.logDirty = true
 	a.mu.Unlock()
 	a.invalidate()
 }
@@ -641,15 +995,31 @@ func (a *app) finish(err error) {
 	a.cmd = nil
 	switch {
 	case err == nil:
-		a.status = "翻译完成。"
+		a.stage = stageDone
 		a.progress = 1
+		a.failed = false
+		if a.lastErr != "" {
+			a.status = "翻译完成，部分页面已保留原图。"
+		} else {
+			a.status = "翻译完成。"
+		}
 	case err == context.Canceled:
+		a.failed = false
+		a.lastErr = ""
 		a.status = "已取消。"
 	default:
-		a.status = "翻译失败，请查看日志。"
+		a.failed = true
+		a.status = "翻译失败。"
+		if a.lastErr == "" {
+			a.lastErr = err.Error()
+		}
 		a.log = append(a.log, "错误："+err.Error())
 	}
 	a.log = append(a.log, a.status)
+	if len(a.log) > 500 {
+		a.log = a.log[len(a.log)-500:]
+	}
+	a.logDirty = true
 	a.mu.Unlock()
 	a.invalidate()
 }

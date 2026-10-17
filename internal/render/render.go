@@ -8,6 +8,7 @@ import (
 	"image/draw"
 	"image/png"
 	"math"
+	"runtime/debug"
 	"strings"
 
 	"github.com/tdewolff/canvas"
@@ -107,7 +108,15 @@ type Options struct {
 // Each block is rendered into its own canvas sized exactly to the usable area,
 // then composited at the box offset. Doing it this way avoids depending on
 // DrawText's anchor semantics and on how canvas swaps axes for vertical text.
-func Render(page image.Image, blocks []Block, opt Options) (image.Image, error) {
+func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err error) {
+	// A bad glyph, font, or degenerate block must not terminate the book.
+	// The caller reverts to the input page when this returns an error.
+	defer func() {
+		if r := recover(); r != nil {
+			out = nil
+			err = fmt.Errorf("render panic: %v\n%s", r, debug.Stack())
+		}
+	}()
 	if page == nil {
 		return nil, fmt.Errorf("render page: nil image")
 	}
@@ -121,8 +130,8 @@ func Render(page image.Image, blocks []Block, opt Options) (image.Image, error) 
 
 	bounds := page.Bounds()
 	w, h := bounds.Dx(), bounds.Dy()
-	out := image.NewRGBA(image.Rect(0, 0, w, h))
-	draw.Draw(out, out.Bounds(), page, bounds.Min, draw.Src)
+	rgba := image.NewRGBA(image.Rect(0, 0, w, h))
+	draw.Draw(rgba, rgba.Bounds(), page, bounds.Min, draw.Src)
 
 	min, max := opt.MinSize, opt.MaxSize
 	if min <= 0 {
@@ -219,8 +228,8 @@ func Render(page image.Image, blocks []Block, opt Options) (image.Image, error) 
 			anchor.Min.X+(anchor.Dx()-usable.Dx())/2+usable.Dx(),
 			anchor.Min.Y+(anchor.Dy()-usable.Dy())/2+usable.Dy(),
 		)
-		draw.Draw(out, dst, layer, image.Point{}, draw.Over)
+		draw.Draw(rgba, dst, layer, image.Point{}, draw.Over)
 	}
 
-	return out, nil
+	return rgba, nil
 }

@@ -79,4 +79,7 @@ if (-not $proc.HasExited) {
 $null = $errTask.Result
 $null = $outTask.Result
 Remove-Item -LiteralPath $outPath -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath ($outPath + '.part') -Force -ErrorAction SilentlyContinue
+$runDir = Join-Path (Split-Path -Parent $outPath) ('.' + (Split-Path -Leaf $outPath) + '.mangatrans')
+Remove-Item -LiteralPath $runDir -Recurse -Force -ErrorAction SilentlyContinue
 Write-Output "result json: $resultPath"

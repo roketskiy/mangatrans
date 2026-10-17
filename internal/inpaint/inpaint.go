@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"runtime/debug"
 
 	ort "github.com/yalue/onnxruntime_go"
 	"golang.org/x/image/draw"
@@ -59,9 +60,25 @@ func (m *Model) Close() error {
 	return m.sess.Destroy()
 }
 
-func (m *Model) Inpaint(src image.Image, textMask *image.Gray) (image.Image, error) {
+func (m *Model) Inpaint(src image.Image, textMask *image.Gray) (out image.Image, err error) {
+	// A malformed mask must never terminate the whole book. Convert any
+	// unexpected panic into a page error so the caller can keep the original
+	// page and continue with the next one.
+	defer func() {
+		if r := recover(); r != nil {
+			out = nil
+			err = fmt.Errorf("inpaint panic: %v\n%s", r, debug.Stack())
+		}
+	}()
+
+	if src == nil {
+		return nil, fmt.Errorf("inpaint: nil source image")
+	}
 	b := src.Bounds()
 	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 {
+		return nil, fmt.Errorf("inpaint: empty source image %v", b)
+	}
 	rgba := image.NewRGBA(image.Rect(0, 0, w, h))
 	draw.Draw(rgba, rgba.Bounds(), src, b.Min, draw.Src)
 	if textMask == nil {
@@ -70,8 +87,16 @@ func (m *Model) Inpaint(src image.Image, textMask *image.Gray) (image.Image, err
 	mask := make([]uint8, w*h)
 	mb := textMask.Bounds()
 	for y := 0; y < h; y++ {
+		sy := mb.Min.Y + y
+		if sy >= mb.Max.Y {
+			continue
+		}
 		for x := 0; x < w; x++ {
-			if mb.Min.X+x < mb.Max.X && mb.Min.Y+y < mb.Max.Y && mb.Min.X+x >= mb.Min.X && mb.Min.Y+y >= mb.Min.Y && textMask.GrayAt(mb.Min.X+x, mb.Min.Y+y).Y > 0 {
+			sx := mb.Min.X + x
+			if sx >= mb.Max.X {
+				continue
+			}
+			if textMask.GrayAt(sx, sy).Y > 0 {
 				mask[y*w+x] = 255
 			}
 		}
@@ -81,13 +106,21 @@ func (m *Model) Inpaint(src image.Image, textMask *image.Gray) (image.Image, err
 	}
 	dilated := dilate(mask, w, h, 6)
 	components := components(dilated, w, h)
+	bounds := image.Rect(0, 0, w, h)
 	for _, r := range components {
-		r = expand(r, 64, w, h)
+		r = expand(r, 64, w, h).Intersect(bounds)
+		if r.Empty() {
+			continue
+		}
 		windows := []image.Rectangle{r}
 		if r.Dx() > 3*r.Dy() || r.Dy() > 3*r.Dx() {
 			windows = split(r)
 		}
 		for _, win := range windows {
+			win = win.Intersect(bounds)
+			if win.Empty() {
+				continue
+			}
 			if solidBackground(rgba, dilated, w, win) {
 				fillMasked(rgba, dilated, w, win, colorAt(rgba, win))
 				continue
@@ -101,6 +134,14 @@ func (m *Model) Inpaint(src image.Image, textMask *image.Gray) (image.Image, err
 }
 
 func (m *Model) inpaintWindow(src *image.RGBA, mask []uint8, w int, r image.Rectangle) error {
+	if src == nil || w <= 0 || len(mask) < w {
+		return fmt.Errorf("inpaint: invalid window %v", r)
+	}
+	h := len(mask) / w
+	r = r.Intersect(src.Bounds()).Intersect(image.Rect(0, 0, w, h))
+	if r.Empty() {
+		return nil
+	}
 	// The model input is a fixed 512x512 patch. Sample it with one mapping
 	// (patch coords -> page coords) and reuse the exact inverse when writing
 	// back, so read and write can never disagree on where a pixel lives.
@@ -259,11 +300,20 @@ func split(r image.Rectangle) []image.Rectangle {
 // screen-tone dots produce local variance, but they also defeat LaMa, so those
 // windows should go to the model anyway. Variance is computed on 0..255 gray.
 func solidBackground(im *image.RGBA, mask []uint8, w int, r image.Rectangle) bool {
+	if im == nil || w <= 0 || len(mask) < w {
+		return false
+	}
+	h := len(mask) / w
+	r = r.Intersect(im.Bounds()).Intersect(image.Rect(0, 0, w, h))
+	if r.Empty() {
+		return false
+	}
 	var s, s2 float64
 	n := 0
 	for y := r.Min.Y; y < r.Max.Y; y++ {
 		for x := r.Min.X; x < r.Max.X; x++ {
-			if mask[y*w+x] > 0 {
+			i := y*w + x
+			if i < 0 || i >= len(mask) || mask[i] > 0 {
 				continue
 			}
 			c := im.RGBAAt(x, y)
@@ -279,13 +329,28 @@ func solidBackground(im *image.RGBA, mask []uint8, w int, r image.Rectangle) boo
 	return s2/float64(n)-math.Pow(s/float64(n), 2) < 40
 }
 func colorAt(im *image.RGBA, r image.Rectangle) color.RGBA {
+	if im == nil {
+		return color.RGBA{}
+	}
+	r = r.Intersect(im.Bounds())
+	if r.Empty() {
+		return color.RGBA{}
+	}
 	return im.RGBAAt((r.Min.X+r.Max.X)/2, (r.Min.Y+r.Max.Y)/2)
 }
 func fillMasked(im *image.RGBA, m []uint8, w int, r image.Rectangle, c color.RGBA) {
+	if im == nil || w <= 0 || len(m) < w {
+		return
+	}
+	h := len(m) / w
+	r = r.Intersect(im.Bounds()).Intersect(image.Rect(0, 0, w, h))
+	if r.Empty() {
+		return
+	}
 	for y := r.Min.Y; y < r.Max.Y; y++ {
 		for x := r.Min.X; x < r.Max.X; x++ {
 			i := y*w + x
-			if m[i] > 0 {
+			if i >= 0 && i < len(m) && m[i] > 0 {
 				im.SetRGBA(x, y, c)
 			}
 		}
@@ -300,7 +365,7 @@ func edgeDistance(m []uint8, w, x, y int) int {
 	for dy := -2; dy <= 2; dy++ {
 		for dx := -2; dx <= 2; dx++ {
 			xx, yy := x+dx, y+dy
-			if xx < 0 || yy < 0 || yy*w+xx >= len(m) || m[yy*w+xx] == 0 {
+			if xx < 0 || yy < 0 || xx >= w || yy*w+xx >= len(m) || m[yy*w+xx] == 0 {
 				cd := max(abs(dx), abs(dy))
 				if cd < d {
 					d = cd

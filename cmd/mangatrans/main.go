@@ -36,6 +36,13 @@ type paths struct {
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("fatal: %v", err)
+		os.Exit(1)
+	}
+}
+
+func run() (err error) {
 	in := flag.String("in", "", "input .cbz/.zip")
 	out := flag.String("out", "", "output .cbz")
 	work := flag.String("work", "", "scratch dir for debug images")
@@ -47,7 +54,21 @@ func main() {
 	benchPath := flag.String("bench-json", "", "write stage timings as JSON to this path")
 	flag.Parse()
 	if *in == "" || *out == "" {
-		log.Fatal("usage: mangatrans -in book.cbz -out book.zh.cbz [-work dir] [-limit N]")
+		return fmt.Errorf("usage: mangatrans -in book.cbz -out book.zh.cbz [-work dir] [-limit N]")
+	}
+	inAbs, err := filepath.Abs(*in)
+	if err != nil {
+		return fmt.Errorf("resolve input path: %w", err)
+	}
+	outAbs, err := filepath.Abs(*out)
+	if err != nil {
+		return fmt.Errorf("resolve output path: %w", err)
+	}
+	if strings.EqualFold(filepath.Clean(inAbs), filepath.Clean(outAbs)) {
+		return fmt.Errorf("output path must differ from input path")
+	}
+	if st, err := os.Stat(outAbs); err == nil && st.IsDir() {
+		return fmt.Errorf("output path is a directory")
 	}
 	started := time.Now()
 	b := &bench{}
@@ -65,13 +86,13 @@ func main() {
 	}
 
 	if *work != "" {
-		os.MkdirAll(*work, 0o755)
+		_ = os.MkdirAll(*work, 0o755)
 	}
 
 	tRead := time.Now()
 	pages, err := cbz.ReadCBZ(*in)
 	if err != nil {
-		log.Fatalf("read input: %v", err)
+		return fmt.Errorf("read input: %w", err)
 	}
 	b.ReadMS = time.Since(tRead).Milliseconds()
 	if *limit > 0 && len(pages) > *limit {
@@ -79,6 +100,36 @@ func main() {
 	}
 	log.Printf("pages: %d", len(pages))
 	b.Pages = len(pages)
+
+	// Keep every intermediate file for this run in one directory next to the
+	// output and delete it on exit, including error and panic paths. Server
+	// logs never go to the user's C: temp directory, and a killed run leaves
+	// at most one small .mangatrans directory, never page images in C:.
+	outDir := filepath.Dir(outAbs)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return fmt.Errorf("create output directory: %w", err)
+	}
+	runDir := filepath.Join(outDir, "."+filepath.Base(outAbs)+".mangatrans")
+	// A forced kill or power loss can leave this directory behind. The UI
+	// allows only one run at a time, so the next run may safely replace it.
+	_ = os.RemoveAll(runDir)
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return fmt.Errorf("create run temp dir: %w", err)
+	}
+	defer os.RemoveAll(runDir)
+	// Keep the run directory clean, but show the last server lines in the
+	// main log before deleting it. Otherwise a start failure only points at a
+	// log file that no longer exists by the time the user opens it.
+	defer func() {
+		if err == nil {
+			return
+		}
+		for _, name := range []string{"ocr.log", "mt.log"} {
+			if tail := readTail(filepath.Join(runDir, name), 24); tail != "" {
+				log.Printf("--- %s (last lines) ---\n%s", name, tail)
+			}
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
@@ -89,31 +140,33 @@ func main() {
 	tLoad := time.Now()
 	ocrSrv, err := llm.Start(ctx, llm.Config{
 		Exe: p.llamaExe, Model: p.ocrModel, MMProj: p.ocrMMProj,
-		LogPath: filepath.Join(os.TempDir(), "mangatrans-ocr.log"),
+		LogPath: filepath.Join(runDir, "ocr.log"),
 		Args:    []string{"-ngl", "99", "-c", "4096", "--temp", "0", "--jinja"},
 	})
 	if err != nil {
-		log.Fatalf("start OCR server: %v", err)
+		return fmt.Errorf("start OCR server: %w", err)
 	}
+	// Kill is idempotent. Register it so every error path also stops the
+	// server, even before the normal OCR stage has finished.
+	defer ocrSrv.Kill()
 	b.LoadOCRMS = time.Since(tLoad).Milliseconds()
 
 	rt, err := infer.Env(p.ortDir, p.cudaDir)
 	if err != nil {
-		log.Fatalf("init onnxruntime: %v", err)
+		return fmt.Errorf("init onnxruntime: %w", err)
 	}
 	defer rt.Destroy()
 
 	tLoad = time.Now()
 	det, err := detect.Load(p.detModel, true, 3<<30)
 	if err != nil {
-		log.Fatalf("load detector: %v", err)
+		return fmt.Errorf("load detector: %w", err)
 	}
 	b.LoadDetMS = time.Since(tLoad).Milliseconds()
 	defer det.Close()
 
 	type pageResult struct {
 		index  int
-		name   string
 		img    image.Image
 		mask   *image.Gray
 		blocks []render.Block
@@ -127,6 +180,7 @@ func main() {
 
 	ocrStart := time.Now()
 	for i, pg := range pages {
+		log.Printf("progress ocr %d/%d", i+1, len(pages))
 		tDecode := time.Now()
 		img, err := decodeImage(pg.Bytes)
 		if err != nil {
@@ -142,7 +196,7 @@ func main() {
 		}
 		b.DetectMS += time.Since(tDetect).Milliseconds()
 
-		pr := &pageResult{index: i, name: pg.Name, img: img, mask: res.Mask}
+		pr := &pageResult{index: i, img: img, mask: res.Mask}
 		for j, box := range res.Boxes {
 			crop := cropRect(img, box.X, box.Y, box.W, box.H, 6)
 			if crop == nil {
@@ -156,7 +210,7 @@ func main() {
 				log.Printf("page %d box %d: ocr failed: %v", i, j, err)
 				continue
 			}
-			text = strings.TrimSpace(text)
+			text = cleanOCR(text)
 			if text == "" || isNoise(text) {
 				continue
 			}
@@ -172,6 +226,7 @@ func main() {
 		results = append(results, pr)
 	}
 	ocrSrv.Kill()
+	log.Printf("progress ocr %d/%d", len(pages), len(pages))
 	log.Printf("OCR done in %s", time.Since(ocrStart).Round(time.Second))
 
 	// Stage B: translation, batched across pages so the model sees context.
@@ -179,11 +234,11 @@ func main() {
 	tLoad = time.Now()
 	mtSrv, err := llm.Start(ctx, llm.Config{
 		Exe: p.llamaExe, Model: p.mtModel,
-		LogPath: filepath.Join(os.TempDir(), "mangatrans-mt.log"),
+		LogPath: filepath.Join(runDir, "mt.log"),
 		Args:    []string{"-ngl", "99", "-c", "8192", "--jinja"},
 	})
 	if err != nil {
-		log.Fatalf("start translation server: %v", err)
+		return fmt.Errorf("start translation server: %w", err)
 	}
 	b.LoadMTMS = time.Since(tLoad).Milliseconds()
 	defer mtSrv.Kill()
@@ -192,7 +247,7 @@ func main() {
 	if *glossaryPath != "" {
 		glossary, err = translate.LoadGlossary(*glossaryPath)
 		if err != nil {
-			log.Fatalf("load glossary: %v", err)
+			return fmt.Errorf("load glossary: %w", err)
 		}
 		log.Printf("glossary: %d terms", len(glossary))
 	}
@@ -201,6 +256,7 @@ func main() {
 	const perBatch = 12
 	mtStart := time.Now()
 	for _, pr := range results {
+		log.Printf("progress translate %d/%d", pr.index+1, len(pages))
 		translated := make(map[int]string, len(pr.texts))
 		for start := 0; start < len(pr.texts); start += perBatch {
 			end := start + perBatch
@@ -243,7 +299,7 @@ func main() {
 				log.Printf("page %d block %d: single retry failed: %v", pr.index, k+1, err)
 				continue
 			}
-			if txt != "" && txt != pr.ocr[k] {
+			if !translate.Untranslated(pr.ocr[k], txt) {
 				pr.blocks[k].Text = txt
 				retries++
 			}
@@ -259,7 +315,9 @@ func main() {
 		}
 	}
 
+	log.Printf("progress translate %d/%d", len(pages), len(pages))
 	log.Printf("translation done in %s", time.Since(mtStart).Round(time.Second))
+	skipped := 0
 	for _, pr := range results {
 		n := 0
 		for _, b := range pr.blocks {
@@ -267,15 +325,20 @@ func main() {
 				n++
 			}
 		}
+		skipped += len(pr.blocks) - n
 		log.Printf("page %d: translated %d/%d blocks", pr.index, n, len(pr.blocks))
+	}
+	if skipped > 0 {
+		log.Printf("warning: %d text blocks kept the original text", skipped)
 	}
 
 	// Stage C: erase original text, then draw translations.
 	log.Printf("starting inpainting")
+	log.Printf("progress inpaint 0/%d", len(pages))
 	tLoad = time.Now()
 	lap, err := inpaint.Load(p.lapModel, true, 3<<30)
 	if err != nil {
-		log.Fatalf("load inpaint model: %v", err)
+		return fmt.Errorf("load inpaint model: %w", err)
 	}
 	b.LoadLamaMS = time.Since(tLoad).Milliseconds()
 	defer lap.Close()
@@ -289,16 +352,20 @@ func main() {
 	}
 
 	outPages := make([]cbz.Page, 0, len(pages))
-	byName := make(map[string]*pageResult, len(results))
+	byIndex := make(map[int]*pageResult, len(results))
 	for _, pr := range results {
-		byName[pr.name] = pr
+		byIndex[pr.index] = pr
 	}
 
 	finishStart := time.Now()
+	reportPage := func(i int) {
+		log.Printf("progress inpaint %d/%d", i+1, len(pages))
+	}
 	for i, pg := range pages {
-		pr := byName[pg.Name]
+		pr := byIndex[i]
 		if pr == nil {
 			outPages = append(outPages, pg)
+			reportPage(i)
 			continue
 		}
 		// Only erase boxes that actually have a translation. Otherwise a
@@ -312,6 +379,7 @@ func main() {
 		}
 		if len(active) == 0 {
 			outPages = append(outPages, pg)
+			reportPage(i)
 			continue
 		}
 		// Build the inpaint mask from the original OCR boxes, before bubble
@@ -346,59 +414,79 @@ func main() {
 		clean, err := lap.Inpaint(pr.img, mask)
 		b.InpaintMS += time.Since(tInpaint).Milliseconds()
 		if err != nil {
-			log.Printf("page %d: inpaint failed: %v", i, err)
-			clean = pr.img
+			// Never draw a translation over the un-erased original: that
+			// would leave two overlapping texts. Keep the page as it was.
+			log.Printf("page %d: inpaint failed, keeping original page: %v", i+1, err)
+			outPages = append(outPages, pg)
+			reportPage(i)
+			continue
 		}
 		tRender := time.Now()
 		final, err := render.Render(clean, active, renderOpt)
 		b.RenderMS += time.Since(tRender).Milliseconds()
 		if err != nil {
-			log.Printf("page %d: render failed: %v", i, err)
-			final = clean
+			// The original text was already erased in memory; revert to the
+			// input page so the reader does not get a blank or half-drawn page.
+			log.Printf("page %d: render failed, keeping original page: %v", i+1, err)
+			outPages = append(outPages, pg)
+			reportPage(i)
+			continue
 		}
 		tEncode := time.Now()
 		data, err := encodeJPEG(final, 92)
 		b.EncodeMS += time.Since(tEncode).Milliseconds()
 		if err != nil {
-			log.Printf("page %d: encode failed: %v", i, err)
+			log.Printf("page %d: encode failed, keeping original page: %v", i+1, err)
 			outPages = append(outPages, pg)
+			reportPage(i)
 			continue
 		}
 		outPages = append(outPages, cbz.Page{Name: pg.Name, Bytes: data})
 		if *work != "" {
-			os.WriteFile(filepath.Join(*work, fmt.Sprintf("p%02d.jpg", i)), data, 0o644)
+			_ = os.WriteFile(filepath.Join(*work, fmt.Sprintf("p%02d.jpg", i)), data, 0o644)
 		}
+		reportPage(i)
 	}
 	log.Printf("finish done in %s", time.Since(finishStart).Round(time.Second))
 
 	tWrite := time.Now()
-	if err := cbz.WriteCBZ(*out, outPages); err != nil {
-		log.Fatalf("write output: %v", err)
-	}
-	b.WriteMS = time.Since(tWrite).Milliseconds()
-	log.Printf("wrote %s (%d pages)", *out, len(outPages))
-
-	// Read the output back and decode every page. This catches a truncated
-	// zip or an encoder failure before the user opens the file.
-	tValidate := time.Now()
-	if check, err := cbz.ReadCBZ(*out); err != nil {
-		log.Printf("validate output: %v", err)
-	} else {
+	validateMS := int64(0)
+	checkCount := 0
+	err = cbz.WriteCBZValidated(*out, outPages, func(part string) error {
+		tValidate := time.Now()
+		defer func() {
+			validateMS = time.Since(tValidate).Milliseconds()
+		}()
+		// Read the completed .part back and decode every page before the
+		// rename. A truncated zip or bad encoder never replaces a good file.
+		check, err := cbz.ReadCBZ(part)
+		if err != nil {
+			return fmt.Errorf("read back: %w", err)
+		}
+		if len(check) != len(outPages) {
+			return fmt.Errorf("%d pages, expected %d", len(check), len(outPages))
+		}
 		bad := 0
 		for _, p := range check {
 			if _, err := decodeImage(p.Bytes); err != nil {
 				bad++
 			}
 		}
-		if len(check) != len(outPages) {
-			log.Printf("validate output: %d pages, expected %d", len(check), len(outPages))
-		} else if bad > 0 {
-			log.Printf("validate output: %d of %d pages do not decode", bad, len(check))
-		} else {
-			log.Printf("validate output: %d pages, all decode", len(check))
+		if bad > 0 {
+			return fmt.Errorf("%d of %d pages do not decode", bad, len(check))
 		}
+		checkCount = len(check)
+		return nil
+	})
+	b.WriteMS = time.Since(tWrite).Milliseconds() - validateMS
+	b.ValidateMS = validateMS
+	if err != nil {
+		return fmt.Errorf("write output: %w", err)
 	}
-	b.ValidateMS = time.Since(tValidate).Milliseconds()
+	log.Printf("progress save %d/%d", len(outPages), len(outPages))
+	log.Printf("wrote %s (%d pages)", *out, len(outPages))
+	log.Printf("validate output: %d pages, all decode", checkCount)
+	log.Printf("progress done %d/%d", len(outPages), len(outPages))
 	b.report(log.Printf, time.Since(started))
 	if *benchPath != "" {
 		if err := b.writeJSON(*benchPath); err != nil {
@@ -407,6 +495,7 @@ func main() {
 			log.Printf("benchmark json: %s", *benchPath)
 		}
 	}
+	return nil
 }
 
 func isNoise(s string) bool {

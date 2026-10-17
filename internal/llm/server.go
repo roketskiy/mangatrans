@@ -22,6 +22,8 @@ type Server struct {
 	exe      string
 	logFile  string
 	logBuf   *bytes.Buffer
+	done     chan struct{}
+	waitErr  error
 	stopOnce sync.Once
 	Shutdown func()
 }
@@ -75,12 +77,21 @@ func Start(ctx context.Context, c Config) (*Server, error) {
 		return nil, fmt.Errorf("start %s: %w", c.Exe, err)
 	}
 
-	s := &Server{cmd: cmd, port: port, exe: c.Exe, logFile: c.LogPath}
+	done := make(chan struct{})
+	s := &Server{cmd: cmd, port: port, exe: c.Exe, logFile: c.LogPath, done: done}
+	go func() {
+		s.waitErr = cmd.Wait()
+		close(done)
+	}()
+
 	s.Shutdown = func() {
 		s.stopOnce.Do(func() {
 			if cmd.Process != nil {
-				cmd.Process.Kill()
-				_, _ = cmd.Process.Wait()
+				_ = cmd.Process.Kill()
+			}
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
 			}
 			logFile.Close()
 		})
@@ -102,6 +113,8 @@ func (s *Server) waitReady(ctx context.Context, timeout time.Duration) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-s.done:
+			return fmt.Errorf("server exited early: %v (log %s)", s.waitErr, s.logFile)
 		default:
 		}
 		resp, err := client.Get(url)
@@ -111,10 +124,6 @@ func (s *Server) waitReady(ctx context.Context, timeout time.Duration) error {
 				return nil
 			}
 			resp.Body.Close()
-		}
-		// The process may have died.
-		if s.cmd.ProcessState != nil && s.cmd.ProcessState.Exited() {
-			return fmt.Errorf("server exited early, log at %s", s.logFile)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
