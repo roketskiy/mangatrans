@@ -28,7 +28,7 @@ func TestSplitBoxByMaskGapsSeparatesTwoVerticalDialogues(t *testing.T) {
 		fillColumnStrip(m, 120, 150, 10, 190)
 	})
 	box := image.Rect(0, 0, 160, 200)
-	segs := splitBoxByMaskGaps(m, box, true)
+	segs := splitBoxByMaskGaps(m, box)
 	if len(segs) != 2 {
 		t.Fatalf("got %d segments, want 2", len(segs))
 	}
@@ -53,7 +53,7 @@ func TestSplitBoxByMaskGapsKeepsOneDialogueTogether(t *testing.T) {
 		}
 	})
 	box := image.Rect(0, 0, 120, 200)
-	if segs := splitBoxByMaskGaps(m, box, true); len(segs) != 0 {
+	if segs := splitBoxByMaskGaps(m, box); len(segs) != 0 {
 		t.Fatalf("got %d segments, want no split", len(segs))
 	}
 }
@@ -66,7 +66,7 @@ func TestSplitBoxByMaskGapsSeparatesThreeDialogues(t *testing.T) {
 		fillColumnStrip(m, 150, 175, 10, 230)
 	})
 	box := image.Rect(0, 0, 180, 240)
-	segs := splitBoxByMaskGaps(m, box, true)
+	segs := splitBoxByMaskGaps(m, box)
 	if len(segs) != 3 {
 		t.Fatalf("got %d segments, want 3", len(segs))
 	}
@@ -79,7 +79,7 @@ func TestSplitBoxByMaskGapsSeparatesHorizontalDialogues(t *testing.T) {
 		fillColumnStrip(m, 10, 190, 95, 125)
 	})
 	box := image.Rect(0, 0, 200, 140)
-	segs := splitBoxByMaskGaps(m, box, false)
+	segs := splitBoxByMaskGaps(m, box)
 	if len(segs) != 2 {
 		t.Fatalf("got %d segments, want 2", len(segs))
 	}
@@ -95,11 +95,11 @@ func TestSplitBoxByMaskGapsSeparatesHorizontalDialogues(t *testing.T) {
 // A lone dialogue or empty pixels never produce segments.
 func TestSplitBoxByMaskGapsRejectsTrivialInput(t *testing.T) {
 	box := image.Rect(0, 0, 100, 100)
-	if segs := splitBoxByMaskGaps(nil, box, true); segs != nil {
+	if segs := splitBoxByMaskGaps(nil, box); segs != nil {
 		t.Fatalf("nil mask gave %v", segs)
 	}
 	empty := grayMask(image.Pt(100, 100), func(m *image.Gray) {})
-	if segs := splitBoxByMaskGaps(empty, box, true); segs != nil {
+	if segs := splitBoxByMaskGaps(empty, box); segs != nil {
 		t.Fatalf("empty mask gave %v", segs)
 	}
 }
@@ -112,7 +112,7 @@ func TestSplitBoxByMaskGapsIgnoresTinySideBand(t *testing.T) {
 		fillColumnStrip(m, 150, 155, 80, 90)
 	})
 	box := image.Rect(0, 0, 200, 200)
-	if segs := splitBoxByMaskGaps(m, box, true); len(segs) != 0 {
+	if segs := splitBoxByMaskGaps(m, box); len(segs) != 0 {
 		t.Fatalf("got %d segments, want no split", len(segs))
 	}
 }
@@ -124,7 +124,7 @@ func TestGrowSegmentMaskKeepsSiblingsWhite(t *testing.T) {
 		fillColumnStrip(m, 90, 110, 10, 150)
 	})
 	box := image.Rect(0, 0, 120, 160)
-	segs := splitBoxByMaskGaps(m, box, true)
+	segs := splitBoxByMaskGaps(m, box)
 	if len(segs) != 2 {
 		t.Fatalf("got %d segments, want 2", len(segs))
 	}

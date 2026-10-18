@@ -41,6 +41,12 @@ func SplitTextRegions(source image.Image, textMask *image.Gray, boxes []image.Re
 	var out []TextRegion
 	for parent, box := range boxes {
 		fallback := TextRegion{Box: box, Parent: parent}
+		if textMask != nil {
+			if children, ok := maskGapRegions(source, textMask, box, parent); ok {
+				out = append(out, children...)
+				continue
+			}
+		}
 		area := areas[parent]
 		if area == nil || textMask == nil {
 			out = append(out, fallback)
@@ -115,6 +121,36 @@ func SplitTextRegions(source image.Image, textMask *image.Gray, boxes []image.Re
 		out = append(out, children...)
 	}
 	return out
+}
+
+// maskGapRegions turns text-mask segments into independently recognized
+// dialogue regions. Area stays nil so the final layout stage fits each child
+// into the bubble shape after erasure.
+func maskGapRegions(source image.Image, textMask *image.Gray, box image.Rectangle, parent int) ([]TextRegion, bool) {
+	segs := splitBoxByMaskGaps(textMask, box)
+	if len(segs) < 2 {
+		return nil, false
+	}
+	for _, seg := range segs {
+		if seg.bounds.Dx() < 6 || seg.bounds.Dy() < 6 {
+			return nil, false
+		}
+	}
+	crop := box.Inset(-8).Intersect(source.Bounds())
+	masks := growSegmentMask(segs, crop)
+	children := make([]TextRegion, len(segs))
+	childBoxes := make([]image.Rectangle, len(segs))
+	for k, seg := range segs {
+		children[k] = TextRegion{Box: seg.bounds, CropMask: masks[k], Parent: parent}
+		childBoxes[k] = seg.bounds
+	}
+	// Fit each child against the source bubble so layout keeps the bubble
+	// shape even before the erased-page refit; a nil fit falls back later.
+	fits := Find(source, 210).FitAreas(childBoxes)
+	for k := range children {
+		children[k].Area = fits[k]
+	}
+	return children, true
 }
 
 // SplitArea removes progressively thicker boundary layers to find two broad

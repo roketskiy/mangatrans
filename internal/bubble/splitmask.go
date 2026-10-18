@@ -13,43 +13,105 @@ type maskSegment struct {
 	pixels []image.Point
 }
 
-// maskBand is a contiguous run of active projection columns.
+// maskBand is a contiguous run of active projection slots.
 type maskBand struct{ start, end int }
 
 // splitBoxByMaskGaps cuts a detector box into dialogue segments using the
 // detector's text mask. Adjacent dialogues that share one box leave a fully
-// blank band between their text pixels, so a projection over the reading axis
-// separates them without relying on bubble colour or outline shape. The box
-// aspect ratio picks the axis: tall boxes hold vertical columns separated
-// across X, wide boxes hold horizontal rows separated across Y.
+// blank band between their text pixels, so a projection over a reading axis
+// separates them without relying on bubble colour or outline shape. Both axes
+// are tried: two vertical bubbles side by side form a wide box, so the box
+// aspect ratio alone can pick the wrong axis. The axis exposing the most
+// credible segments wins; ties keep the box's own reading axis.
 //
-// Returns nil when the pixels do not form at least two credible segments.
-func splitBoxByMaskGaps(textMask *image.Gray, box image.Rectangle, sourceVertical bool) []maskSegment {
+// Segments come back in reading order: right to left for vertical text, top
+// to bottom otherwise. Returns nil when the pixels do not form at least two
+// credible segments.
+func splitBoxByMaskGaps(textMask *image.Gray, box image.Rectangle) []maskSegment {
 	if textMask == nil {
 		return nil
 	}
-	vertical := box.Dy() > box.Dx()
-	project, inside := projectMask(textMask, box, vertical)
+	boxVertical := box.Dy() >= box.Dx()
+	var best []maskSegment
+	for _, vertical := range []bool{boxVertical, !boxVertical} {
+		segs := splitByAxis(textMask, box, vertical)
+		if betterSegments(segs, best) {
+			best = segs
+		}
+	}
+	if len(best) < 2 {
+		return nil
+	}
+	if boxVertical {
+		// Vertical Japanese reads right to left across the segments.
+		for i, j := 0, len(best)-1; i < j; i, j = i+1, j-1 {
+			best[i], best[j] = best[j], best[i]
+		}
+	}
+	return best
+}
+
+// betterSegments reports whether the candidate beats the incumbent. More
+// segments win because a missed split is worse than an extra candidate on a
+// genuinely conjoined box; balanced pixel shares break ties toward the box's
+// own axis, which runs first.
+func betterSegments(candidate, incumbent []maskSegment) bool {
+	if len(candidate) == 0 {
+		return false
+	}
+	if len(incumbent) == 0 {
+		return true
+	}
+	if len(candidate) != len(incumbent) {
+		return len(candidate) > len(incumbent)
+	}
+	return balance(candidate) < balance(incumbent)
+}
+
+// balance scores how unevenly the text mass is distributed over segments.
+func balance(segs []maskSegment) float64 {
 	total := 0
+	for _, s := range segs {
+		total += len(s.pixels)
+	}
+	mean := float64(total) / float64(len(segs))
+	var variance float64
+	for _, s := range segs {
+		d := float64(len(s.pixels)) - mean
+		variance += d * d
+	}
+	return variance / float64(len(segs))
+}
+
+// splitByAxis projects the mask over one reading axis and cuts at quiet
+// bands. A gap must be quiet, wide, and flanked by real text on both sides;
+// strokes inside one dialogue never leave such a band, while separate
+// dialogues do.
+func splitByAxis(textMask *image.Gray, box image.Rectangle, vertical bool) []maskSegment {
+	project, inside := projectMask(textMask, box, vertical)
+	if len(project) == 0 {
+		return nil
+	}
+	total := 0
+	maxSlot := 0
 	for _, v := range project {
 		total += v
+		maxSlot = max(maxSlot, v)
 	}
 	if total < 64 {
 		return nil
 	}
-
-	// A gap must be quiet, wide relative to the busiest band, and flanked by
-	// real text on both sides. Character strokes inside one dialogue never
-	// leave such a band on the reading axis, while separate dialogues do.
-	maxColumn := 0
-	for _, v := range project {
-		maxColumn = max(maxColumn, v)
-	}
-	quiet := max(1, maxColumn/50)
-	const minGap = 6
+	quiet := max(1, maxSlot/50)
+	// Real dialogue gaps run 15px or more on manga pages, while gaps between
+	// text columns inside one dialogue stay under 5px of pure silence.
+	const minGap = 10
 	const minBand = 16
 
-	var bands []maskBand
+	// Collect active runs first, then merge runs separated by a silence
+	// narrower than minGap, and only then drop runs too narrow to be a
+	// dialogue. Order matters: merging before the width filter keeps tight
+	// column groups together instead of dropping them one by one.
+	var runs []maskBand
 	start := -1
 	for i, v := range project {
 		if v > quiet {
@@ -57,20 +119,33 @@ func splitBoxByMaskGaps(textMask *image.Gray, box image.Rectangle, sourceVertica
 				start = i
 			}
 		} else if start >= 0 {
-			if i-start >= minBand {
-				bands = append(bands, maskBand{start, i})
-			}
+			runs = append(runs, maskBand{start, i})
 			start = -1
 		}
 	}
-	if start >= 0 && len(project)-start >= minBand {
-		bands = append(bands, maskBand{start, len(project)})
+	if start >= 0 {
+		runs = append(runs, maskBand{start, len(project)})
 	}
+	var bands []maskBand
+	for _, r := range runs {
+		if len(bands) > 0 && r.start-bands[len(bands)-1].end < minGap {
+			bands[len(bands)-1].end = r.end
+		} else {
+			bands = append(bands, r)
+		}
+	}
+	filtered := bands[:0]
+	for _, b := range bands {
+		if b.end-b.start >= minBand {
+			filtered = append(filtered, b)
+		}
+	}
+	bands = filtered
 	if len(bands) < 2 {
 		return nil
 	}
 
-	// Keep the widest bands when there are too many to be dialogues.
+	// Keep the busiest bands when there are too many to be dialogues.
 	const maxSegments = 4
 	if len(bands) > maxSegments {
 		sorted := append([]maskBand(nil), bands...)
@@ -83,13 +158,11 @@ func splitBoxByMaskGaps(textMask *image.Gray, box image.Rectangle, sourceVertica
 		bands = keep
 	}
 
-	segments := make([]maskSegment, 0, len(bands))
+	var segments []maskSegment
 	for _, b := range bands {
 		seg := maskSegment{}
 		for i := b.start; i < b.end; i++ {
-			for _, p := range inside[i] {
-				seg.pixels = append(seg.pixels, p)
-			}
+			seg.pixels = append(seg.pixels, inside[i]...)
 		}
 		if len(seg.pixels) == 0 {
 			continue
@@ -112,9 +185,6 @@ func splitBoxByMaskGaps(textMask *image.Gray, box image.Rectangle, sourceVertica
 		if len(seg.pixels) >= minPixels {
 			kept = append(kept, seg)
 		}
-	}
-	if len(kept) < 2 {
-		return nil
 	}
 	return kept
 }
@@ -160,7 +230,7 @@ func projectMask(textMask *image.Gray, box image.Rectangle, vertical bool) ([]in
 	return project, inside
 }
 
-// growSegmentMask builds a source-pixel owner mask for one segment: segment
+// growSegmentMask builds a source-pixel owner mask for each segment: segment
 // pixels stay owned, and every other pixel inside the grown crop joins the
 // nearest segment through BFS, so OCR crops never show a sibling's glyphs.
 func growSegmentMask(segments []maskSegment, crop image.Rectangle) []*image.Alpha {
