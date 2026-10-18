@@ -54,6 +54,11 @@ func main() {
 	}
 
 	a := &app{status: "选择文件后开始。"}
+	if len(os.Args) > 2 && os.Args[1] == "-logtest" {
+		if n, err := strconv.Atoi(os.Args[2]); err == nil {
+			seedLog(a, n)
+		}
+	}
 	mygo.App.WhenReady(func() {
 		a.win = mygo.NewWindow(mygo.WindowOptions{
 			Title:           "漫画翻译器",
@@ -83,6 +88,19 @@ func main() {
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// seedLog pre-fills the log with n realistic lines for layout debugging:
+// run with -logtest N to open the window in a full-log state without
+// starting a translation.
+func seedLog(a *app, n int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i := 0; i < n; i++ {
+		a.log = append(a.log, fmt.Sprintf("page %d: translated %d/%d blocks", i+1, 5+i%9, 9))
+	}
+	a.log = append(a.log, "warning: 13 text blocks kept the original text")
+	a.logDirty = true
 }
 
 func (a *app) view(c *ui.Context) {
@@ -139,7 +157,10 @@ func (a *app) view(c *ui.Context) {
 
 	root.Background(appBg).Children(func() {
 		a.topBar(c, headerH, bar.Right)
-		ui.Row(c).Fill().Background(appBg).Padding(20).Gap(20).
+		// Grow(1) lets this row shrink below its content's intrinsic height:
+		// the log inside scrolls, and without it a full log pushes the cards
+		// past the window edge, hiding the action row.
+		ui.Row(c).Fill().Grow(1).Background(appBg).Padding(20).Gap(20).
 			AlignItems(ui.Stretch).Children(func() {
 			a.settingsCard(c, over, busy, status, progress, done, total, stage, failed, lastErr)
 			a.logCard(c, lines, busy, failed)
@@ -404,8 +425,8 @@ func (a *app) logCard(c *ui.Context, lines []string, busy, failed bool) {
 			ui.Text(c, meta).FontSize(10).TextColor(muted)
 		})
 		ui.Row(c).Height(1).Background(innerLine)
-		ui.Column(c).Fill().Padding(12).Children(func() {
-			inner := ui.Column(c).Fill().Background(ui.RGB(250, 250, 251)).
+		ui.Column(c).Fill().Grow(1).MinHeight(0).Padding(12).Children(func() {
+			inner := ui.Column(c).Fill().Grow(1).MinHeight(0).Background(ui.RGB(250, 250, 251)).
 				Border(1, innerLine).Radius(10).Padding(14)
 			if len(lines) == 0 {
 				text := "暂无日志"
