@@ -22,19 +22,21 @@ import (
 	"mangatrans/internal/llm"
 	"mangatrans/internal/perf"
 	"mangatrans/internal/render"
+	"mangatrans/internal/segment"
 	"mangatrans/internal/translate"
 )
 
 type paths struct {
-	llamaExe  string
-	ocrModel  string
-	ocrMMProj string
-	mtModel   string
-	detModel  string
-	lapModel  string
-	ortDir    string
-	cudaDir   string
-	fontPath  string
+	llamaExe       string
+	ocrModel       string
+	ocrMMProj      string
+	mtModel        string
+	detModel       string
+	lapModel       string
+	ortDir         string
+	cudaDir        string
+	bubbleSegModel string
+	fontPath       string
 }
 
 func main() {
@@ -110,15 +112,16 @@ func run() (err error) {
 	b := &bench{}
 
 	p := paths{
-		llamaExe:  envOr("MANGATRANS_LLAMA", `C:\Users\Public\Temp\opencode\llamacpp\llama\llama-server.exe`),
-		ocrModel:  envOr("MANGATRANS_OCR_MODEL", `E:\work\transl\models\PaddleOCR-VL-manga-Q4_K_M.gguf`),
-		ocrMMProj: envOr("MANGATRANS_MMPROJ", `E:\work\transl\models\mmproj-Q8_0.gguf`),
-		mtModel:   *mtModel,
-		detModel:  envOr("MANGATRANS_DET_MODEL", `E:\work\transl\.cache\onnx-probe\comictextdetector.onnx`),
-		lapModel:  envOr("MANGATRANS_LAMA_MODEL", `E:\work\transl\.cache\onnx-probe\lama-manga.onnx`),
-		ortDir:    envOr("MANGATRANS_ORT_DIR", `E:\work\transl\runtime\ort-cuda13`),
-		cudaDir:   envOr("MANGATRANS_CUDA_DIR", `E:\Python312\Lib\site-packages\torch\lib`),
-		fontPath:  *fontPath,
+		llamaExe:       envOr("MANGATRANS_LLAMA", `C:\Users\Public\Temp\opencode\llamacpp\llama\llama-server.exe`),
+		ocrModel:       envOr("MANGATRANS_OCR_MODEL", `E:\work\transl\models\PaddleOCR-VL-manga-Q4_K_M.gguf`),
+		ocrMMProj:      envOr("MANGATRANS_MMPROJ", `E:\work\transl\models\mmproj-Q8_0.gguf`),
+		mtModel:        *mtModel,
+		detModel:       envOr("MANGATRANS_DET_MODEL", `E:\work\transl\.cache\onnx-probe\comictextdetector.onnx`),
+		lapModel:       envOr("MANGATRANS_LAMA_MODEL", `E:\work\transl\.cache\onnx-probe\lama-manga.onnx`),
+		bubbleSegModel: envOr("MANGATRANS_BUBBLE_SEG", `E:\work\transl\models\mangalens-bubble-seg.onnx`),
+		ortDir:         envOr("MANGATRANS_ORT_DIR", `E:\work\transl\runtime\ort-cuda13`),
+		cudaDir:        envOr("MANGATRANS_CUDA_DIR", `E:\Python312\Lib\site-packages\torch\lib`),
+		fontPath:       *fontPath,
 	}
 	trace.FilesUsed(map[string]string{
 		"llama_server": p.llamaExe, "ocr_model": p.ocrModel, "mmproj": p.ocrMMProj,
@@ -236,6 +239,23 @@ func run() (err error) {
 	defer closeDetector()
 	results := make([]*pageResult, 0, len(pages))
 
+	// Optional bubble segmenter: instance masks replace the white-interior
+	// heuristic for layout areas and split boxes at balloon boundaries.
+	var segModel *segment.Model
+	if p.bubbleSegModel != "" {
+		endSpan = trace.Span("operation", "load_bubble_seg", -1, -1)
+		segModel, err = segment.Load(p.bubbleSegModel, true, 3<<30, 1600)
+		endSpan(err)
+		if err != nil {
+			return fmt.Errorf("load bubble segmenter: %w", err)
+		}
+		defer func() {
+			end := trace.Span("operation", "unload_bubble_seg", -1, -1)
+			end(segModel.Close())
+		}()
+		log.Printf("bubble segmenter: %s", p.bubbleSegModel)
+	}
+
 	detParams := detect.DefaultParams()
 	detParams.ConfThreshold = float32(*conf)
 
@@ -269,7 +289,22 @@ func run() (err error) {
 		for j, box := range res.Boxes {
 			parentBoxes[j] = image.Rect(int(box.X), int(box.Y), int(box.X+box.W), int(box.Y+box.H))
 		}
-		regions := bubble.SplitTextRegions(img, res.Mask, parentBoxes)
+		var balloons []bubble.Balloon
+		if segModel != nil {
+			found, err := segModel.Run(img, segment.DefaultParams())
+			if err != nil {
+				log.Printf("page %d: bubble segmentation failed, using geometric splitters: %v", i, err)
+			}
+			for _, bub := range found {
+				balloons = append(balloons, bubble.Balloon{Box: bub.Box, Mask: bub.Mask})
+			}
+		}
+		var regions []bubble.TextRegion
+		if len(balloons) > 0 {
+			regions = bubble.SplitWithBubbles(img, res.Mask, balloons, parentBoxes)
+		} else {
+			regions = bubble.SplitTextRegions(img, res.Mask, parentBoxes)
+		}
 		pageMetrics[i].OCRRegions = len(regions)
 		endSpan(nil)
 
@@ -300,6 +335,7 @@ func run() (err error) {
 				Area:       region.Area,
 				SourceArea: region.CropMask,
 				Vertical:   direction.IsVertical(region.Box.Dy() > region.Box.Dx()),
+				Anchor:     region.Box,
 				SizeHint:   estimateFontSize(res.Mask, region.Box, len([]rune(text))),
 			})
 			pr.ocr = append(pr.ocr, text)

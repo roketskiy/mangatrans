@@ -48,16 +48,20 @@ func renderShape(dst *image.RGBA, b Block, mask *image.Alpha, pageBounds image.R
 	// The lane grid changes discretely with font size, so feasibility is not
 	// strictly monotone. Try practical sizes from largest down in half-point
 	// steps and always check the caller's exact minimum as the last candidate.
+	anchor := b.Anchor
+	if anchor.Empty() {
+		anchor = mb
+	}
 	var placements []shapePlacement
 	for size := max; size > min; size -= 0.5 {
-		if p, ok := shapeLayout(mask, mb, runes, b.Vertical, font, fill, size); ok {
+		if p, ok := shapeLayout(mask, mb, runes, b.Vertical, font, fill, size, anchor); ok {
 			placements = p
 			break
 		}
 	}
 	if len(placements) == 0 {
 		var ok bool
-		placements, ok = shapeLayout(mask, mb, runes, b.Vertical, font, fill, min)
+		placements, ok = shapeLayout(mask, mb, runes, b.Vertical, font, fill, min, anchor)
 		if !ok || len(placements) == 0 {
 			return fmt.Errorf("translation does not fit safe area at minimum size %.2f", min)
 		}
@@ -116,8 +120,10 @@ func opaqueBounds(mask *image.Alpha) image.Rectangle {
 
 // shapeLayout fits one independently recognized dialogue into safe lanes.
 // Dialogue boundaries are decided before OCR; this function only wraps the
-// corresponding translation, preserving its rune order.
-func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertical bool, font *canvas.Font, fill color.Color, size float64) ([]shapePlacement, bool) {
+// corresponding translation, preserving its rune order. Lanes must overlap
+// the anchor rectangle when possible, keeping each dialogue near its own
+// original text instead of drifting across a shared balloon shape.
+func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertical bool, font *canvas.Font, fill color.Color, size float64, anchor image.Rectangle) ([]shapePlacement, bool) {
 	fontPx := size * shapePtToMM / pxToMM
 	thickness := int(math.Ceil(fontPx * 1.55))
 	if thickness < 4 {
@@ -141,36 +147,46 @@ func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertic
 		}
 	}
 	// Find the shortest sequence of lanes that actually fits, preferring the
-	// sequence nearest the writable shape centre when widths tie.
+	// sequence nearest the anchor centre when widths tie. A first pass
+	// requires the window to overlap the anchor; if that leaves nothing,
+	// a second pass accepts any window.
 	start, end, bestCount := -1, -1, len(lanes)+1
 	bestDist := math.Inf(1)
-	center := float64(bounds.Min.X+bounds.Max.X) / 2
+	center := float64(anchor.Min.X+anchor.Max.X) / 2
 	if !vertical {
-		center = float64(bounds.Min.Y+bounds.Max.Y) / 2
+		center = float64(anchor.Min.Y+anchor.Max.Y) / 2
 	}
-	for i := range lanes {
-		estimate := 0
-		for j := i; j < len(lanes); j++ {
-			estimate += caps[j]
-			if estimate < len(runes) {
-				continue
-			}
-			if _, ok := fitLaneWindow(lanes[i:j+1], runes, vertical, size, font, fill); !ok {
-				continue
-			}
-			count := j - i + 1
-			first, last := lanes[i].rect, lanes[j].rect
-			mid := center
-			if vertical {
-				mid = float64(first.Min.X+last.Max.X) / 2
-			} else {
-				mid = float64(first.Min.Y+last.Max.Y) / 2
-			}
-			dist := math.Abs(mid - center)
-			if count < bestCount || (count == bestCount && dist < bestDist) {
-				start, end, bestCount, bestDist = i, j+1, count, dist
-			}
+	for _, requireOverlap := range []bool{true, false} {
+		if start >= 0 {
 			break
+		}
+		for i := range lanes {
+			estimate := 0
+			for j := i; j < len(lanes); j++ {
+				estimate += caps[j]
+				if estimate < len(runes) {
+					continue
+				}
+				if _, ok := fitLaneWindow(lanes[i:j+1], runes, vertical, size, font, fill); !ok {
+					continue
+				}
+				if requireOverlap && windowRect(lanes[i:j+1]).Intersect(anchor).Empty() {
+					continue
+				}
+				count := j - i + 1
+				first, last := lanes[i].rect, lanes[j].rect
+				mid := center
+				if vertical {
+					mid = float64(first.Min.X+last.Max.X) / 2
+				} else {
+					mid = float64(first.Min.Y+last.Max.Y) / 2
+				}
+				dist := math.Abs(mid - center)
+				if count < bestCount || (count == bestCount && dist < bestDist) {
+					start, end, bestCount, bestDist = i, j+1, count, dist
+				}
+				break
+			}
 		}
 	}
 	if start < 0 {
@@ -182,6 +198,15 @@ func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertic
 		return nil, false
 	}
 	return rebalancePlacements(placements, vertical, size, font, fill), true
+}
+
+// windowRect is the union rectangle of a run of consecutive lanes.
+func windowRect(lanes []shapeLane) image.Rectangle {
+	r := lanes[0].rect
+	for _, lane := range lanes[1:] {
+		r = r.Union(lane.rect)
+	}
+	return r
 }
 
 func fitLaneWindow(lanes []shapeLane, runes []rune, vertical bool, size float64, font *canvas.Font, fill color.Color) ([]shapePlacement, bool) {
