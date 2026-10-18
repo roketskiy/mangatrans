@@ -83,6 +83,14 @@ type Block struct {
 	Box      image.Rectangle
 	Text     string
 	Vertical bool
+	// Area, when set, is the safe speech-bubble shape in page coordinates.
+	// Pixels with alpha below 255 are treated as outside the writable area.
+	// A non-nil empty or unusable area is an error: callers can then revert the
+	// page instead of silently dropping translated text.
+	Area *image.Alpha
+	// SourceArea owns original pixels when a detector box was split before OCR.
+	// It prevents erasure of a sibling dialogue whose recognition failed.
+	SourceArea *image.Alpha
 	// Anchor, when set, is the speech-bubble rectangle used for placement.
 	// Box still controls the font size, so a longer translation cannot grow
 	// past the original text footprint and leave the bubble.
@@ -168,6 +176,9 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 			b.Box.Max.X-int(pad), b.Box.Max.Y-int(pad),
 		).Intersect(image.Rect(0, 0, w, h))
 		if usable.Dx() < 8 || usable.Dy() < 8 {
+			if b.Area != nil {
+				return nil, fmt.Errorf("render shaped block at %v: source box is too small to establish a font size", b.Box)
+			}
 			continue
 		}
 
@@ -198,6 +209,15 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 		}
 		text := layout(lo)
 		if text.Empty() {
+			if b.Area != nil {
+				return nil, fmt.Errorf("render shaped block at %v: source box cannot establish a font size", b.Box)
+			}
+			continue
+		}
+		if b.Area != nil {
+			if err := renderShape(rgba, b, b.Area, bounds, font, blockFill, min, lo); err != nil {
+				return nil, fmt.Errorf("render shaped block at %v: %w", b.Box, err)
+			}
 			continue
 		}
 

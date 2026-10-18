@@ -9,12 +9,14 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"mangatrans/internal/perf"
 )
 
 type contextContext = context.Context
 
-func jsonMarshal(v interface{}) ([]byte, error)         { return json.Marshal(v) }
-func jsonUnmarshal(b []byte, v interface{}) error       { return json.Unmarshal(b, v) }
+func jsonMarshal(v interface{}) ([]byte, error)   { return json.Marshal(v) }
+func jsonUnmarshal(b []byte, v interface{}) error { return json.Unmarshal(b, v) }
 func newRequest(ctx contextContext, method, url string, body []byte) (*http.Request, error) {
 	return http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 }
@@ -58,7 +60,9 @@ type mmChatRequest struct {
 
 // ChatMultimodal sends a chat completion with image parts.
 // PNG/JPEG bytes are inlined as base64 data URLs.
-func (s *Server) ChatMultimodal(ctx contextContext, messages []MultimodalMessage, temperature float64, maxTokens int) (string, error) {
+func (s *Server) ChatMultimodal(ctx contextContext, messages []MultimodalMessage, temperature float64, maxTokens int) (content string, err error) {
+	end := perf.Request(ctx, "ocr_http")
+	defer func() { end(err) }()
 	body, err := jsonMarshal(mmChatRequest{
 		Messages:    messages,
 		Temperature: temperature,

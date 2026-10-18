@@ -1,6 +1,7 @@
 package inpaint
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"image/color"
@@ -11,6 +12,7 @@ import (
 	"golang.org/x/image/draw"
 
 	"mangatrans/internal/infer"
+	"mangatrans/internal/perf"
 )
 
 const side = 512
@@ -60,7 +62,7 @@ func (m *Model) Close() error {
 	return m.sess.Destroy()
 }
 
-func (m *Model) Inpaint(src image.Image, textMask *image.Gray) (out image.Image, err error) {
+func (m *Model) Inpaint(ctx context.Context, src image.Image, textMask *image.Gray) (out image.Image, err error) {
 	// A malformed mask must never terminate the whole book. Convert any
 	// unexpected panic into a page error so the caller can keep the original
 	// page and continue with the next one.
@@ -105,35 +107,57 @@ func (m *Model) Inpaint(src image.Image, textMask *image.Gray) (out image.Image,
 		return rgba, nil
 	}
 	dilated := dilate(mask, w, h, 6)
-	components := components(dilated, w, h)
+	initialComponents := maskComponents(dilated, w, h)
+	perf.Count(ctx, "inpaint_components", len(initialComponents))
+	for _, component := range initialComponents {
+		local := expand(component.bounds, 8, w, h)
+		if bg, ok := localSolidBackground(rgba, dilated, w, local); ok {
+			perf.Count(ctx, "inpaint_windows", 1)
+			perf.Count(ctx, "inpaint_fills", 1)
+			perf.Count(ctx, "inpaint_local_fills", 1)
+			fillComponent(rgba, dilated, w, component, bg)
+		}
+	}
+	edges := edgeDistances(dilated, w, h)
+	components := maskComponents(dilated, w, h)
 	bounds := image.Rect(0, 0, w, h)
-	for _, r := range components {
+	var windows []image.Rectangle
+	for _, component := range components {
+		r := component.bounds
 		r = expand(r, 64, w, h).Intersect(bounds)
 		if r.Empty() {
 			continue
 		}
-		windows := []image.Rectangle{r}
+		parts := []image.Rectangle{r}
 		if r.Dx() > 3*r.Dy() || r.Dy() > 3*r.Dx() {
-			windows = split(r)
+			parts = split(r)
 		}
-		for _, win := range windows {
-			win = win.Intersect(bounds)
-			if win.Empty() {
-				continue
-			}
-			if solidBackground(rgba, dilated, w, win) {
-				fillMasked(rgba, dilated, w, win, colorAt(rgba, win))
-				continue
-			}
-			if err := m.inpaintWindow(rgba, dilated, w, win); err != nil {
-				return nil, err
-			}
+		windows = append(windows, parts...)
+	}
+	windows = mergeOverlapping(windows)
+	for _, win := range windows {
+		win = win.Intersect(bounds)
+		if win.Empty() {
+			continue
+		}
+		perf.Count(ctx, "inpaint_windows", 1)
+		if bg, ok := solidBackground(rgba, dilated, w, win); ok {
+			perf.Count(ctx, "inpaint_fills", 1)
+			fillMasked(rgba, dilated, w, win, bg)
+			continue
+		}
+		perf.Count(ctx, "inpaint_model_calls", 1)
+		end := perf.ContextSpan(ctx, "nested", "inpaint_window")
+		e := m.inpaintWindow(ctx, rgba, dilated, edges, w, win)
+		end(e)
+		if err := e; err != nil {
+			return nil, err
 		}
 	}
 	return rgba, nil
 }
 
-func (m *Model) inpaintWindow(src *image.RGBA, mask []uint8, w int, r image.Rectangle) error {
+func (m *Model) inpaintWindow(ctx context.Context, src *image.RGBA, mask, edges []uint8, w int, r image.Rectangle) error {
 	if src == nil || w <= 0 || len(mask) < w {
 		return fmt.Errorf("inpaint: invalid window %v", r)
 	}
@@ -180,7 +204,10 @@ func (m *Model) inpaintWindow(src *image.RGBA, mask []uint8, w int, r image.Rect
 		}
 	}
 	// LaMa treats nonzero mask pixels as holes: koharu-slim/crates/koharu-ml/src/lama/mod.rs:183-186 thresholds the mask with gt(1.0).
-	if err := m.sess.Run(); err != nil {
+	endModel := perf.ContextSpan(ctx, "nested", "inpaint_model")
+	err := m.sess.Run()
+	endModel(err)
+	if err != nil {
 		return fmt.Errorf("run inpaint model for window %v: %w", r, err)
 	}
 	od := m.out.GetData()
@@ -198,7 +225,7 @@ func (m *Model) inpaintWindow(src *image.RGBA, mask []uint8, w int, r image.Rect
 			if mask[i] == 0 {
 				continue
 			}
-			edge := edgeDistance(mask, w, x, y)
+			edge := edges[i]
 			a := math.Min(1, float64(edge)/2)
 			si := py*side + px
 			p := src.PixOffset(x, y)
@@ -245,8 +272,22 @@ func dilate(a []uint8, w, h, r int) []uint8 {
 	return o
 }
 func components(a []uint8, w, h int) []image.Rectangle {
+	regions := maskComponents(a, w, h)
+	out := make([]image.Rectangle, len(regions))
+	for i, c := range regions {
+		out[i] = c.bounds
+	}
+	return out
+}
+
+type maskComponent struct {
+	bounds image.Rectangle
+	pixels []int
+}
+
+func maskComponents(a []uint8, w, h int) []maskComponent {
 	seen := make([]bool, len(a))
-	var out []image.Rectangle
+	var out []maskComponent
 	for i, v := range a {
 		if v == 0 || seen[i] {
 			continue
@@ -254,9 +295,11 @@ func components(a []uint8, w, h int) []image.Rectangle {
 		q := []int{i}
 		seen[i] = true
 		x0, x1, y0, y1 := i%w, i%w, i/w, i/w
+		var pixels []int
 		for len(q) > 0 {
 			n := q[len(q)-1]
 			q = q[:len(q)-1]
+			pixels = append(pixels, n)
 			x, y := n%w, n/w
 			x0 = min(x0, x)
 			x1 = max(x1, x)
@@ -269,7 +312,7 @@ func components(a []uint8, w, h int) []image.Rectangle {
 				}
 			}
 		}
-		out = append(out, image.Rect(x0, y0, x1+1, y1+1))
+		out = append(out, maskComponent{bounds: image.Rect(x0, y0, x1+1, y1+1), pixels: pixels})
 	}
 	return out
 }
@@ -287,11 +330,36 @@ func split(r image.Rectangle) []image.Rectangle {
 	} else {
 		for y := r.Min.Y; y < r.Max.Y; {
 			z := min(r.Max.Y, y+max(1, r.Dx()))
-			o = append(o, image.Rect(r.Min.X, y, r.Max.Y, z))
+			o = append(o, image.Rect(r.Min.X, y, r.Max.X, z))
 			y = z
 		}
 	}
 	return o
+}
+
+// mergeOverlapping joins only intersecting windows, and only when their union
+// still fits a single model patch. Adjacent split strips remain independent.
+func mergeOverlapping(in []image.Rectangle) []image.Rectangle {
+	out := append([]image.Rectangle(nil), in...)
+	for changed := true; changed; {
+		changed = false
+		for i := 0; i < len(out) && !changed; i++ {
+			for j := i + 1; j < len(out); j++ {
+				if !out[i].Overlaps(out[j]) {
+					continue
+				}
+				u := out[i].Union(out[j])
+				if u.Dx() > side || u.Dy() > side {
+					continue
+				}
+				out[i] = u
+				out = append(out[:j], out[j+1:]...)
+				changed = true
+				break
+			}
+		}
+	}
+	return out
 }
 
 // solidBackground reports whether the unmasked pixels in the window are close
@@ -299,16 +367,34 @@ func split(r image.Rectangle) []image.Rectangle {
 // small variance lets us skip the model entirely. The threshold is generous:
 // screen-tone dots produce local variance, but they also defeat LaMa, so those
 // windows should go to the model anyway. Variance is computed on 0..255 gray.
-func solidBackground(im *image.RGBA, mask []uint8, w int, r image.Rectangle) bool {
+func solidBackground(im *image.RGBA, mask []uint8, w int, r image.Rectangle) (color.RGBA, bool) {
+	bg, _, ok := backgroundColor(im, mask, w, r, 16, 8)
+	return bg, ok
+}
+
+func localSolidBackground(im *image.RGBA, mask []uint8, w int, r image.Rectangle) (color.RGBA, bool) {
+	bg, samples, ok := backgroundColor(im, mask, w, r, 4, 5)
+	if !ok || samples < 64 || samples*4 < r.Dx()*r.Dy() {
+		return color.RGBA{}, false
+	}
+	nearWhite := bg.R >= 223 && bg.G >= 223 && bg.B >= 223
+	nearBlack := bg.R <= 32 && bg.G <= 32 && bg.B <= 32
+	if !nearWhite && !nearBlack {
+		return color.RGBA{}, false
+	}
+	return bg, true
+}
+
+func backgroundColor(im *image.RGBA, mask []uint8, w int, r image.Rectangle, maxVariance, maxChannelSpread float64) (color.RGBA, int, bool) {
 	if im == nil || w <= 0 || len(mask) < w {
-		return false
+		return color.RGBA{}, 0, false
 	}
 	h := len(mask) / w
 	r = r.Intersect(im.Bounds()).Intersect(image.Rect(0, 0, w, h))
 	if r.Empty() {
-		return false
+		return color.RGBA{}, 0, false
 	}
-	var s, s2 float64
+	var sums, squares [3]uint64
 	n := 0
 	for y := r.Min.Y; y < r.Max.Y; y++ {
 		for x := r.Min.X; x < r.Max.X; x++ {
@@ -317,26 +403,32 @@ func solidBackground(im *image.RGBA, mask []uint8, w int, r image.Rectangle) boo
 				continue
 			}
 			c := im.RGBAAt(x, y)
-			v := float64(c.R+c.G+c.B) / 3
-			s += v
-			s2 += v * v
+			for k, v := range []uint8{c.R, c.G, c.B} {
+				sums[k] += uint64(v)
+				squares[k] += uint64(v) * uint64(v)
+			}
 			n++
 		}
 	}
 	if n == 0 {
-		return false
+		return color.RGBA{}, 0, false
 	}
-	return s2/float64(n)-math.Pow(s/float64(n), 2) < 40
-}
-func colorAt(im *image.RGBA, r image.Rectangle) color.RGBA {
-	if im == nil {
-		return color.RGBA{}
+	means := [3]float64{}
+	var out [3]uint8
+	for k := range means {
+		means[k] = float64(sums[k]) / float64(n)
+		variance := float64(squares[k])/float64(n) - means[k]*means[k]
+		// Require genuinely flat, near-neutral surroundings; this errs toward
+		// sending illustrations and colored art to the inpainting model.
+		if variance > maxVariance {
+			return color.RGBA{}, n, false
+		}
+		out[k] = uint8(means[k] + 0.5)
 	}
-	r = r.Intersect(im.Bounds())
-	if r.Empty() {
-		return color.RGBA{}
+	if math.Max(math.Max(means[0], means[1]), means[2])-math.Min(math.Min(means[0], means[1]), means[2]) > maxChannelSpread {
+		return color.RGBA{}, n, false
 	}
-	return im.RGBAAt((r.Min.X+r.Max.X)/2, (r.Min.Y+r.Max.Y)/2)
+	return color.RGBA{R: out[0], G: out[1], B: out[2], A: 255}, n, true
 }
 func fillMasked(im *image.RGBA, m []uint8, w int, r image.Rectangle, c color.RGBA) {
 	if im == nil || w <= 0 || len(m) < w {
@@ -357,6 +449,14 @@ func fillMasked(im *image.RGBA, m []uint8, w int, r image.Rectangle, c color.RGB
 	}
 }
 
+func fillComponent(im *image.RGBA, componentMask []uint8, w int, component maskComponent, c color.RGBA) {
+	for _, i := range component.pixels {
+		im.SetRGBA(i%w, i/w, c)
+		// Clear only pixels belonging to this connected component.
+		componentMask[i] = 0
+	}
+}
+
 // edgeDistance approximates how deep a masked pixel sits inside the hole, in
 // the 5x5 neighborhood. Pixels at the rim (distance 0) blend with the original
 // image so the patch boundary does not show a hard seam.
@@ -374,6 +474,17 @@ func edgeDistance(m []uint8, w, x, y int) int {
 		}
 	}
 	return d
+}
+func edgeDistances(mask []uint8, w, h int) []uint8 {
+	out := make([]uint8, len(mask))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			if mask[y*w+x] > 0 {
+				out[y*w+x] = uint8(edgeDistance(mask, w, x, y))
+			}
+		}
+	}
+	return out
 }
 func clamp(v float64) float64 { return math.Max(0, math.Min(255, v)) }
 

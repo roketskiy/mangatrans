@@ -67,7 +67,7 @@ func (c *Client) TranslateBatch(ctx context.Context, blocks []Block) (Result, er
 	}
 
 	result := make(Result, len(blocks))
-	pending := blocks
+	pending := append([]Block(nil), blocks...)
 	var lastErr error
 
 	for attempt := 0; attempt < 2 && len(pending) > 0; attempt++ {

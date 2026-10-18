@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"image"
 	"image/color"
@@ -18,14 +20,16 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("usage: probe-detect <input.cbz> [outdir]")
+	sweep := flag.Bool("sweep", false, "run the focused postprocessing parameter sweep")
+	flag.Parse()
+	if flag.NArg() < 1 {
+		fmt.Println("usage: probe-detect [-sweep] <input.cbz> [outdir]")
 		os.Exit(1)
 	}
-	in := os.Args[1]
+	in := flag.Arg(0)
 	outDir := `E:\work\transl\.cache\detect-out`
-	if len(os.Args) > 2 {
-		outDir = os.Args[2]
+	if flag.NArg() > 1 {
+		outDir = flag.Arg(1)
 	}
 	os.MkdirAll(outDir, 0o755)
 
@@ -47,39 +51,89 @@ func main() {
 	}
 	defer m.Close()
 
-	params := detect.DefaultParams()
-	for i, p := range pages {
+	variants := []struct {
+		name   string
+		params detect.Params
+	}{
+		{"conf-025", paramsWith(func(p *detect.Params) { p.ConfThreshold = 0.25 })},
+		{"conf-035", paramsWith(func(p *detect.Params) { p.ConfThreshold = 0.35 })},
+		{"conf-045", paramsWith(func(p *detect.Params) { p.ConfThreshold = 0.45 })},
+		{"conf-055", paramsWith(func(p *detect.Params) { p.ConfThreshold = 0.55 })},
+		{"nms-020", paramsWith(func(p *detect.Params) { p.ConfThreshold, p.NMSThreshold = 0.35, 0.20 })},
+		{"nms-050", paramsWith(func(p *detect.Params) { p.ConfThreshold, p.NMSThreshold = 0.35, 0.50 })},
+		{"nms-070", paramsWith(func(p *detect.Params) { p.ConfThreshold, p.NMSThreshold = 0.35, 0.70 })},
+		{"box-000", paramsWith(func(p *detect.Params) { p.ConfThreshold, p.BoxDilation = 0.35, 0 })},
+		{"box-003", paramsWith(func(p *detect.Params) { p.ConfThreshold, p.BoxDilation = 0.35, 3 })},
+		{"close-000", paramsWith(func(p *detect.Params) { p.ConfThreshold, p.CloseRadius = 0.35, 0 })},
+		{"close-005", paramsWith(func(p *detect.Params) { p.ConfThreshold, p.CloseRadius = 0.35, 5 })},
+		{"close-015", paramsWith(func(p *detect.Params) { p.ConfThreshold, p.CloseRadius = 0.35, 15 })},
+	}
+	if !*sweep {
+		variants = []struct {
+			name   string
+			params detect.Params
+		}{{"default", paramsWith(func(p *detect.Params) { p.ConfThreshold = 0.35 })}}
+	}
+	type record struct {
+		Variant string        `json:"variant"`
+		Page    string        `json:"page"`
+		Params  detect.Params `json:"params"`
+		Boxes   []infer.Rect  `json:"boxes"`
+		MaskPct float64       `json:"mask_percent"`
+	}
+	var records []record
+	for i, page := range pages {
 		if i >= 6 {
 			break
 		}
-		img, err := decode(p.Bytes)
+		img, err := decode(page.Bytes)
 		if err != nil {
-			fmt.Printf("page %d decode: %v\n", i, err)
+			fmt.Printf("page %s decode: %v\n", page.Name, err)
 			continue
 		}
-		b := img.Bounds()
-		t0 := time.Now()
-		res, err := m.Run(img, params)
-		if err != nil {
-			fmt.Printf("page %d detect: %v\n", i, err)
-			continue
-		}
-		dt := time.Since(t0)
-
-		var masked int
-		for _, v := range res.Mask.Pix {
-			if v != 0 {
-				masked++
+		for _, variant := range variants {
+			t0 := time.Now()
+			res, err := m.Run(img, variant.params)
+			if err != nil {
+				fmt.Printf("%s %s detect: %v\n", variant.name, page.Name, err)
+				continue
+			}
+			dt := time.Since(t0)
+			var masked int
+			for _, v := range res.Mask.Pix {
+				if v != 0 {
+					masked++
+				}
+			}
+			maskPct := 100 * float64(masked) / float64(len(res.Mask.Pix))
+			fmt.Printf("%-9s page=%-12s boxes=%2d mask=%.1f%% time=%v\n",
+				variant.name, page.Name, len(res.Boxes), maskPct, dt.Round(time.Millisecond))
+			records = append(records, record{variant.name, page.Name, variant.params, res.Boxes, maskPct})
+			if *sweep {
+				dir := filepath.Join(outDir, variant.name)
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					panic(err)
+				}
+				savePNG(filepath.Join(dir, page.Name), overlay(img, res.Boxes))
+			} else {
+				savePNG(filepath.Join(outDir, page.Name), overlay(img, res.Boxes))
 			}
 		}
-		fmt.Printf("page %d %dx%d boxes=%d mask_px=%.1f%% %v\n",
-			i, b.Dx(), b.Dy(), len(res.Boxes), 100*float64(masked)/float64(len(res.Mask.Pix)), dt.Round(time.Millisecond))
-
-		vis := overlay(img, res.Boxes)
-		out := filepath.Join(outDir, fmt.Sprintf("p%02d.png", i))
-		savePNG(out, vis)
-		_ = os.Stdout
 	}
+	data, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "boxes.json"), data, 0o644); err != nil {
+		panic(err)
+	}
+}
+
+func paramsWith(change func(*detect.Params)) detect.Params {
+	p := detect.DefaultParams()
+	p.ConfThreshold = 0.35
+	change(&p)
+	return p
 }
 
 func decode(b []byte) (image.Image, error) {

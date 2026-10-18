@@ -13,6 +13,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"mangatrans/internal/perf"
 )
 
 // Server manages one llama-server subprocess.
@@ -184,7 +186,9 @@ func (s *Server) chat(ctx context.Context, messages []ChatMessage, temperature f
 	return content, err
 }
 
-func (s *Server) chatStatus(ctx context.Context, messages []ChatMessage, temperature float64, maxTokens int, rf *responseFormat) (string, int, error) {
+func (s *Server) chatStatus(ctx context.Context, messages []ChatMessage, temperature float64, maxTokens int, rf *responseFormat) (content string, status int, err error) {
+	endRequest := perf.Request(ctx, "llm_http")
+	defer func() { endRequest(err) }()
 	body, err := json.Marshal(chatRequest{
 		Messages:       messages,
 		Temperature:    temperature,

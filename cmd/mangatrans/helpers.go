@@ -115,6 +115,14 @@ func restrictMask(full *image.Gray, blocks []render.Block) *image.Gray {
 			continue
 		}
 		for y := r.Min.Y; y < r.Max.Y; y++ {
+			if blk.SourceArea != nil {
+				for x := r.Min.X; x < r.Max.X; x++ {
+					if blk.SourceArea.AlphaAt(x, y).A == 255 {
+						out.SetGray(x, y, full.GrayAt(x, y))
+					}
+				}
+				continue
+			}
 			// PixOffset respects a non-zero image origin and stride. The old
 			// y*Stride arithmetic silently assumed both were zero.
 			src := full.PixOffset(r.Min.X, y)

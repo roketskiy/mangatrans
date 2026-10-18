@@ -3,6 +3,7 @@
 package inpaint
 
 import (
+	"context"
 	"image"
 	"image/color"
 	"os"
@@ -44,7 +45,7 @@ func TestInpaintRemovesMarkedText(t *testing.T) {
 			}
 		}
 	}
-	out, err := m.Inpaint(img, mask)
+	out, err := m.Inpaint(context.Background(), img, mask)
 	if err != nil {
 		t.Fatal(err)
 	}
