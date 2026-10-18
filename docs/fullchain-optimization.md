@@ -52,6 +52,17 @@
 - 页 4 左上合并块和底部两组对白全部拆开（`regions-v2/overlay-04.png`）。
 - 字号不再顶满大气泡（`compare-p00.png`、`compare-p03.png`、`compare-p04.png` 为前后对比）。
 
+## 气泡分割模型（同日晚追加）
+
+在几何启发式之上接入了实例分割模型 `huyvux3005/manga109-segmentation-bubble`（MangaLens，YOLO11n-seg，Apache-2.0，Manga109 训练）：
+
+- 模型文件 `models/mangalens-bubble-seg.onnx`（11.9MB，1600 输入，`scripts/export_mangalens.py` 一条命令重导出；导出不能开 onnxslim 简化，它会折错 anchor reshape）。
+- `internal/segment` 负责 ONNX 前向、NMS 和原型掩膜合成，输出页面绝对坐标的实例掩膜。
+- `bubble.SplitWithBubbles` 把每个文本框的文字像素按实例归属分组：单实例框保留内部投影拆分、子段继承实例掩膜做排版区域；跨实例框在实例边界拆开；无实例解释的框走原几何链路。
+- `render.Block.Anchor` 兑现：排版 lane 窗口锚定原文段框，多段共享一个气泡形状时不再向形状中心漂移。
+
+验收（`bubble.cbz` 六页）：实例数 8/9/10/13/8/10，掩膜贴合云朵锯齿边和黑色气泡内部；分段数与纯投影方案一致（69 块），但深色和异形气泡首次有了精确形状；页 1 与页 4 的多瓣连体气泡全部按瓣落位。分割耗时约 0.3 秒/页。叠加图在 `.cache/fullchain/seg-probe/`，渲染对比在 `v4-work/`。
+
 ## 遗留问题
 
 - 「ワンピース」被译成「哭哭奕」一类的 OCR/翻译错误仍在，属于识别与翻译环节，本轮未动。
