@@ -300,6 +300,7 @@ func run() (err error) {
 				Area:       region.Area,
 				SourceArea: region.CropMask,
 				Vertical:   direction.IsVertical(region.Box.Dy() > region.Box.Dx()),
+				SizeHint:   estimateFontSize(res.Mask, region.Box, len([]rune(text))),
 			})
 			pr.ocr = append(pr.ocr, text)
 			pageMetrics[i].OCRAccepted++
@@ -444,7 +445,7 @@ func run() (err error) {
 	renderOpt := render.Options{
 		FontPath:  p.fontPath,
 		MinSize:   1.2,
-		MaxSize:   16.0,
+		MaxSize:   18.0,
 		Padding:   3,
 		TextColor: color.RGBA{A: 255},
 	}

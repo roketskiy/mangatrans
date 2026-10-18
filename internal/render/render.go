@@ -95,6 +95,10 @@ type Block struct {
 	// Box still controls the font size, so a longer translation cannot grow
 	// past the original text footprint and leave the bubble.
 	Anchor image.Rectangle
+	// SizeHint estimates the source type size in pixels from the original
+	// text ink. Zero means no estimate; the render ceiling then stays at the
+	// configured maximum.
+	SizeHint float64
 	// TextColor is chosen per block from the original glyph colour. The zero
 	// value falls back to Options.TextColor.
 	TextColor color.RGBA
@@ -197,7 +201,16 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 
 		// Largest size whose rendered extent fits. Overflow flags are the
 		// reliable signal; Width/Height swap meaning between writing modes.
-		lo, hi := min, max
+		// A source-size hint caps the ceiling so translations track the
+		// original type size instead of growing to fill big regions.
+		ceiling := max
+		if b.SizeHint > 0 {
+			hinted := 1.2 * b.SizeHint
+			if hinted >= min && hinted < ceiling {
+				ceiling = hinted
+			}
+		}
+		lo, hi := min, ceiling
 		for n := 0; n < 20; n++ {
 			mid := (lo + hi) / 2
 			t := layout(mid)

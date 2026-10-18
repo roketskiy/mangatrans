@@ -11,6 +11,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math"
 	"os"
 	"strings"
 
@@ -98,6 +99,28 @@ func ocrBox(ctx context.Context, srv *llm.Server, crop image.Image) (string, err
 		},
 	}
 	return srv.ChatMultimodal(ctx, []llm.MultimodalMessage{msg}, 0.0, 256)
+}
+
+// estimateFontSize guesses the source type size from ink density: mask area
+// over the recognised character count, assuming Japanese glyphs cover about
+// a third of their em square. Returns 0 when either input is unusable.
+func estimateFontSize(mask *image.Gray, box image.Rectangle, chars int) float64 {
+	if mask == nil || chars <= 0 {
+		return 0
+	}
+	r := box.Intersect(mask.Rect)
+	area := 0
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		for x := r.Min.X; x < r.Max.X; x++ {
+			if mask.GrayAt(x, y).Y > 0 {
+				area++
+			}
+		}
+	}
+	if area == 0 {
+		return 0
+	}
+	return math.Sqrt(float64(area) / float64(chars) / 0.33)
 }
 
 // restrictMask keeps text-mask pixels only inside boxes that will be redrawn.
