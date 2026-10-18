@@ -43,11 +43,41 @@ func TestSplitWithBubblesSeparatesBoxAcrossTwoBalloons(t *testing.T) {
 	if regions[0].Box.Min.X < 100 {
 		t.Fatalf("first region is not the right balloon: %v", regions[0].Box)
 	}
-	if regions[0].Area != bB.Mask || regions[1].Area != bA.Mask {
-		t.Fatalf("children did not inherit their own balloon masks")
+	for i, region := range regions {
+		if region.Area == nil {
+			t.Fatalf("child %d has no balloon mask", i)
+		}
+		atRight := region.Area.AlphaAt(150, 50).A == 255
+		atLeft := region.Area.AlphaAt(50, 50).A == 255
+		if i == 0 && (!atRight || atLeft) {
+			t.Fatalf("child 0 is not the right balloon mask")
+		}
+		if i == 1 && (!atLeft || atRight) {
+			t.Fatalf("child 1 is not the left balloon mask")
+		}
 	}
 	if regions[0].CropMask == nil || regions[1].CropMask == nil {
 		t.Fatalf("split children must own their source pixels")
+	}
+}
+
+// Layout masks are eroded so glyphs stay clear of the balloon outline.
+func TestErodeAlphaShrinksByRadius(t *testing.T) {
+	bounds := image.Rect(0, 0, 40, 40)
+	balloon := balloonAt(bounds, image.Rect(5, 5, 35, 35))
+	inner := erodeAlpha(balloon.Mask, 2)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			want := x >= 5+2 && x < 35-2 && y >= 5+2 && y < 35-2
+			if got := inner.AlphaAt(x, y).A == 255; got != want {
+				t.Fatalf("pixel (%d,%d) = %v, want %v", x, y, got, want)
+			}
+		}
+	}
+	// A balloon thinner than twice the radius erodes to nothing.
+	thin := balloonAt(image.Rect(0, 0, 20, 20), image.Rect(8, 0, 12, 20))
+	if got := erodeAlpha(thin.Mask, 2); got.AlphaAt(10, 10).A != 0 {
+		t.Fatalf("thin balloon survived erosion")
 	}
 }
 
@@ -63,8 +93,13 @@ func TestSplitWithBubblesKeepsSingleBalloonBoxWhole(t *testing.T) {
 	if len(regions) != 1 {
 		t.Fatalf("got %d regions, want 1", len(regions))
 	}
-	if regions[0].Area != bA.Mask {
-		t.Fatalf("region did not inherit the balloon mask")
+	area := regions[0].Area
+	if area == nil {
+		t.Fatalf("region did not inherit a balloon mask")
+	}
+	// The inherited mask is the balloon eroded by the layout margin.
+	if area.AlphaAt(30, 30).A != 255 || area.AlphaAt(11, 50).A != 0 {
+		t.Fatalf("area mask is not the eroded balloon shape")
 	}
 	if regions[0].CropMask != nil {
 		t.Fatalf("unsplit region needs no source-owner mask")

@@ -2,6 +2,7 @@ package bubble
 
 import (
 	"image"
+	"image/color"
 	"sort"
 )
 
@@ -29,9 +30,15 @@ const wholeShare = 0.8
 // through SplitTextRegions' geometric path.
 func SplitWithBubbles(source image.Image, textMask *image.Gray, balloons []Balloon, boxes []image.Rectangle) []TextRegion {
 	areas := Find(source, 210).FitAreas(boxes)
+	// Layout masks shrink a little so glyphs keep a margin from the outline;
+	// membership still uses the full masks.
+	inner := make([]Balloon, len(balloons))
+	for i, bl := range balloons {
+		inner[i] = Balloon{Box: bl.Box, Mask: erodeAlpha(bl.Mask, 2)}
+	}
 	var out []TextRegion
 	for parent, box := range boxes {
-		if regions, ok := balloonRegions(source, textMask, balloons, box, parent); ok {
+		if regions, ok := balloonRegions(source, textMask, balloons, inner, box, parent); ok {
 			out = append(out, regions...)
 			continue
 		}
@@ -43,7 +50,7 @@ func SplitWithBubbles(source image.Image, textMask *image.Gray, balloons []Ballo
 // balloonRegions groups one box's text pixels by the balloon instance holding
 // them. It reports false when the box is unexplained: no balloons, too little
 // in-balloon text, or a split the shares do not back.
-func balloonRegions(source image.Image, textMask *image.Gray, balloons []Balloon, box image.Rectangle, parent int) ([]TextRegion, bool) {
+func balloonRegions(source image.Image, textMask *image.Gray, balloons, inner []Balloon, box image.Rectangle, parent int) ([]TextRegion, bool) {
 	if textMask == nil || len(balloons) == 0 {
 		return nil, false
 	}
@@ -88,11 +95,11 @@ func balloonRegions(source image.Image, textMask *image.Gray, balloons []Balloon
 		regions, ok := maskGapRegions(source, textMask, box, parent)
 		if ok {
 			for i := range regions {
-				regions[i].Area = balloons[order[0]].Mask
+				regions[i].Area = inner[order[0]].Mask
 			}
 			return regions, true
 		}
-		region := TextRegion{Box: box, Area: balloons[order[0]].Mask, Parent: parent}
+		region := TextRegion{Box: box, Area: inner[order[0]].Mask, Parent: parent}
 		return []TextRegion{region}, true
 	}
 	if claimed*10 < total*8 {
@@ -133,7 +140,7 @@ func balloonRegions(source image.Image, textMask *image.Gray, balloons []Balloon
 	for i, k := range holders {
 		children[i] = TextRegion{
 			Box:      segs[i].bounds,
-			Area:     balloons[k].Mask,
+			Area:     inner[k].Mask,
 			CropMask: masks[i],
 			Parent:   parent,
 		}
@@ -148,4 +155,74 @@ func balloonRegions(source image.Image, textMask *image.Gray, balloons []Balloon
 		return a.Min.Y < b.Min.Y
 	})
 	return children, true
+}
+
+// erodeAlpha shrinks the opaque region by radius pixels with a two-pass
+// chamfer distance transform, so rendered glyphs keep a margin from the
+// balloon outline.
+func erodeAlpha(mask *image.Alpha, radius int) *image.Alpha {
+	b := mask.Bounds()
+	w, h := b.Dx(), b.Dy()
+	const big = 1 << 30
+	dist := make([]int, w*h)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			if mask.AlphaAt(b.Min.X+x, b.Min.Y+y).A == 255 {
+				dist[y*w+x] = big
+			}
+		}
+	}
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			i := y*w + x
+			if dist[i] == 0 {
+				continue
+			}
+			d := dist[i]
+			if x > 0 {
+				d = min(d, dist[i-1]+1)
+			}
+			if y > 0 {
+				d = min(d, dist[i-w]+1)
+			}
+			if x > 0 && y > 0 {
+				d = min(d, dist[i-w-1]+2)
+			}
+			if x < w-1 && y > 0 {
+				d = min(d, dist[i-w+1]+2)
+			}
+			dist[i] = d
+		}
+	}
+	for y := h - 1; y >= 0; y-- {
+		for x := w - 1; x >= 0; x-- {
+			i := y*w + x
+			if dist[i] == 0 {
+				continue
+			}
+			d := dist[i]
+			if x < w-1 {
+				d = min(d, dist[i+1]+1)
+			}
+			if y < h-1 {
+				d = min(d, dist[i+w]+1)
+			}
+			if x < w-1 && y < h-1 {
+				d = min(d, dist[i+w+1]+2)
+			}
+			if x > 0 && y < h-1 {
+				d = min(d, dist[i+w-1]+2)
+			}
+			dist[i] = d
+		}
+	}
+	out := image.NewAlpha(b)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			if dist[y*w+x] > radius {
+				out.SetAlpha(b.Min.X+x, b.Min.Y+y, color.Alpha{A: 255})
+			}
+		}
+	}
+	return out
 }
