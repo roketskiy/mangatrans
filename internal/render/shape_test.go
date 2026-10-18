@@ -27,7 +27,7 @@ func TestShapeLayoutConservesRunes(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			text := "连接的气泡需要完整文字。第二个气泡"
-			placements, ok := shapeLayout(tc.mask, opaqueBounds(tc.mask), []rune(text), tc.vertical, font, color.Black, 4, opaqueBounds(tc.mask))
+			placements, ok := shapeLayout(tc.mask, opaqueBounds(tc.mask), []rune(text), tc.vertical, font, color.Black, 4, opaqueBounds(tc.mask), nil)
 			if !ok {
 				t.Fatal("shape layout failed")
 			}
@@ -54,7 +54,7 @@ func TestShapeLayoutBalancesAdjacentLanes(t *testing.T) {
 		}
 	}
 	text := "天地玄黄宇宙洪荒日月盈"
-	placements, ok := shapeLayout(mask, mask.Bounds(), []rune(text), true, font, color.Black, 8, mask.Bounds())
+	placements, ok := shapeLayout(mask, mask.Bounds(), []rune(text), true, font, color.Black, 8, mask.Bounds(), nil)
 	if !ok {
 		t.Fatal("shape layout failed")
 	}

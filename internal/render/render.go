@@ -9,6 +9,7 @@ import (
 	"image/png"
 	"math"
 	"runtime/debug"
+	"sort"
 	"strings"
 
 	"github.com/tdewolff/canvas"
@@ -115,6 +116,49 @@ type Options struct {
 	StrokeWidth float64
 }
 
+// sortShapedBlocks orders shaped blocks so siblings sharing one balloon mask
+// are placed in reading order (vertical text right to left, horizontal top to
+// bottom by anchor), which is the order the exclusive lane assignment
+// consumes. Unshaped blocks keep their relative order in front.
+func sortShapedBlocks(blocks []Block) []Block {
+	out := make([]Block, 0, len(blocks))
+	for _, b := range blocks {
+		if b.Area == nil {
+			out = append(out, b)
+		}
+	}
+	byArea := map[*image.Alpha][]Block{}
+	order := []*image.Alpha{}
+	for _, b := range blocks {
+		if b.Area == nil {
+			continue
+		}
+		if _, seen := byArea[b.Area]; !seen {
+			order = append(order, b.Area)
+		}
+		byArea[b.Area] = append(byArea[b.Area], b)
+	}
+	for _, area := range order {
+		group := byArea[area]
+		sort.SliceStable(group, func(i, j int) bool {
+			a, c := group[i].Anchor, group[j].Anchor
+			if a.Empty() {
+				a = group[i].Box
+			}
+			if c.Empty() {
+				c = group[j].Box
+			}
+			if group[i].Vertical {
+				// Vertical Japanese reads right to left.
+				return (a.Min.X + a.Max.X) > (c.Min.X + c.Max.X)
+			}
+			return (a.Min.Y + a.Max.Y) < (c.Min.Y + c.Max.Y)
+		})
+		out = append(out, group...)
+	}
+	return out
+}
+
 // Render draws translated text into each block's box on a copy of page.
 //
 // Each block is rendered into its own canvas sized exactly to the usable area,
@@ -157,6 +201,11 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 	if opt.TextColor.A == 0 {
 		fill = canvas.Black
 	}
+
+	// Dialogues sharing one balloon shape are laid out in reading order with
+	// mutually exclusive lane windows, so their columns cannot interleave.
+	occ := map[*image.Alpha][]image.Rectangle{}
+	blocks = sortShapedBlocks(blocks)
 
 	for _, b := range blocks {
 		b.Text = normalize(b.Text)
@@ -228,7 +277,10 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 			continue
 		}
 		if b.Area != nil {
-			if err := renderShape(rgba, b, b.Area, bounds, font, blockFill, min, lo); err != nil {
+			occupied := occ[b.Area]
+			err := renderShape(rgba, b, b.Area, bounds, font, blockFill, min, lo, &occupied)
+			occ[b.Area] = occupied
+			if err != nil {
 				return nil, fmt.Errorf("render shaped block at %v: %w", b.Box, err)
 			}
 			continue

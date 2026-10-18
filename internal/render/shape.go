@@ -31,8 +31,10 @@ type shapePlacement struct {
 // renderShape finds one common font size for the full translation, partitions
 // the text over safe rectangular lanes, and rasterises each lane separately.
 // Since every glyph canvas is contained by a lane whose every pixel is safe,
-// the rendered ink cannot cross the supplied alpha mask.
-func renderShape(dst *image.RGBA, b Block, mask *image.Alpha, pageBounds image.Rectangle, font *canvas.Font, fill color.Color, min, max float64) error {
+// the rendered ink cannot cross the supplied alpha mask. Lane windows also
+// avoid the rectangles already handed to sibling dialogues sharing this
+// bubble shape; occupied grows by this dialogue's window on success.
+func renderShape(dst *image.RGBA, b Block, mask *image.Alpha, pageBounds image.Rectangle, font *canvas.Font, fill color.Color, min, max float64, occupied *[]image.Rectangle) error {
 	runes := []rune(b.Text)
 	if len(runes) == 0 {
 		return nil
@@ -54,17 +56,20 @@ func renderShape(dst *image.RGBA, b Block, mask *image.Alpha, pageBounds image.R
 	}
 	var placements []shapePlacement
 	for size := max; size > min; size -= 0.5 {
-		if p, ok := shapeLayout(mask, mb, runes, b.Vertical, font, fill, size, anchor); ok {
+		if p, ok := shapeLayout(mask, mb, runes, b.Vertical, font, fill, size, anchor, *occupied); ok {
 			placements = p
 			break
 		}
 	}
 	if len(placements) == 0 {
 		var ok bool
-		placements, ok = shapeLayout(mask, mb, runes, b.Vertical, font, fill, min, anchor)
+		placements, ok = shapeLayout(mask, mb, runes, b.Vertical, font, fill, min, anchor, *occupied)
 		if !ok || len(placements) == 0 {
 			return fmt.Errorf("translation does not fit safe area at minimum size %.2f", min)
 		}
+	}
+	for _, p := range placements {
+		*occupied = append(*occupied, p.lane.rect)
 	}
 
 	for _, p := range placements {
@@ -122,8 +127,11 @@ func opaqueBounds(mask *image.Alpha) image.Rectangle {
 // Dialogue boundaries are decided before OCR; this function only wraps the
 // corresponding translation, preserving its rune order. Lanes must overlap
 // the anchor rectangle when possible, keeping each dialogue near its own
-// original text instead of drifting across a shared balloon shape.
-func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertical bool, font *canvas.Font, fill color.Color, size float64, anchor image.Rectangle) ([]shapePlacement, bool) {
+// original text instead of drifting across a shared bubble shape. Windows
+// also dodge the occupied rectangles of sibling dialogues already placed on
+// this bubble; the constraint relaxes stepwise so a crowded balloon still
+// lays out rather than failing outright.
+func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertical bool, font *canvas.Font, fill color.Color, size float64, anchor image.Rectangle, occupied []image.Rectangle) ([]shapePlacement, bool) {
 	fontPx := size * shapePtToMM / pxToMM
 	thickness := int(math.Ceil(fontPx * 1.55))
 	if thickness < 4 {
@@ -147,16 +155,16 @@ func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertic
 		}
 	}
 	// Find the shortest sequence of lanes that actually fits, preferring the
-	// sequence nearest the anchor centre when widths tie. A first pass
-	// requires the window to overlap the anchor; if that leaves nothing,
-	// a second pass accepts any window.
+	// sequence nearest the anchor centre when widths tie. Constraint passes
+	// relax stepwise: anchored and disjoint from siblings first, then merely
+	// anchored, then anywhere.
 	start, end, bestCount := -1, -1, len(lanes)+1
 	bestDist := math.Inf(1)
 	center := float64(anchor.Min.X+anchor.Max.X) / 2
 	if !vertical {
 		center = float64(anchor.Min.Y+anchor.Max.Y) / 2
 	}
-	for _, requireOverlap := range []bool{true, false} {
+	for _, relax := range []int{0, 1, 2} {
 		if start >= 0 {
 			break
 		}
@@ -167,10 +175,14 @@ func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertic
 				if estimate < len(runes) {
 					continue
 				}
-				if _, ok := fitLaneWindow(lanes[i:j+1], runes, vertical, size, font, fill); !ok {
+				window := windowRect(lanes[i : j+1])
+				if relax < 1 && window.Intersect(anchor).Empty() {
 					continue
 				}
-				if requireOverlap && windowRect(lanes[i:j+1]).Intersect(anchor).Empty() {
+				if relax < 2 && touchesAny(window, occupied) {
+					continue
+				}
+				if _, ok := fitLaneWindow(lanes[i:j+1], runes, vertical, size, font, fill); !ok {
 					continue
 				}
 				count := j - i + 1
@@ -198,6 +210,16 @@ func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertic
 		return nil, false
 	}
 	return rebalancePlacements(placements, vertical, size, font, fill), true
+}
+
+// touchesAny reports whether the window overlaps an occupied rectangle.
+func touchesAny(window image.Rectangle, occupied []image.Rectangle) bool {
+	for _, r := range occupied {
+		if !window.Intersect(r).Empty() {
+			return true
+		}
+	}
+	return false
 }
 
 // windowRect is the union rectangle of a run of consecutive lanes.
