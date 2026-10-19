@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -21,27 +22,38 @@ import (
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
+	"mangatrans/settings"
 )
 
 type app struct {
-	mu        sync.Mutex
-	win       *mygo.Window
-	input     string
-	output    string
-	busy      bool
-	status    string
-	progress  float64
-	done      int
-	total     int
-	stage     int
-	failed    bool
-	lastErr   string
-	log       []string
-	logDirty  bool
-	logFollow bool
-	logView   ui.ScrollState
-	cancel    context.CancelFunc
-	cmd       *exec.Cmd
+	page                appPage
+	settings            settings.Config
+	settingsPath        string
+	settingsError       string
+	settingsLoadFailed  bool
+	editor              settings.Config
+	lastSettingsAttempt settings.Config
+	integerInputs       map[*int]*float64
+	category            settingsCategory
+	settingsScroll      [5]ui.ScrollState
+	mu                  sync.Mutex
+	win                 *mygo.Window
+	input               string
+	output              string
+	busy                bool
+	status              string
+	progress            float64
+	done                int
+	total               int
+	stage               int
+	failed              bool
+	lastErr             string
+	log                 []string
+	logDirty            bool
+	logFollow           bool
+	logView             ui.ScrollState
+	cancel              context.CancelFunc
+	cmd                 *exec.Cmd
 }
 
 func main() {
@@ -53,7 +65,8 @@ func main() {
 		log.Printf("job object: %v", err)
 	}
 
-	a := &app{status: "选择文件后开始。"}
+	a := &app{status: "选择文件后开始。", settings: settings.Default()}
+	a.loadSettings()
 	if len(os.Args) > 2 && os.Args[1] == "-logtest" {
 		if n, err := strconv.Atoi(os.Args[2]); err == nil {
 			seedLog(a, n)
@@ -157,6 +170,10 @@ func (a *app) view(c *ui.Context) {
 
 	root.Background(appBg).Children(func() {
 		a.topBar(c, headerH, bar.Right)
+		if a.page == pageSettings {
+			a.settingsView(c, busy)
+			return
+		}
 		// Grow(1) lets this row shrink below its content's intrinsic height:
 		// the log inside scrolls, and without it a full log pushes the cards
 		// past the window edge, hiding the action row.
@@ -177,6 +194,16 @@ func (a *app) topBar(c *ui.Context, height, right float32) {
 			ui.Text(c, "译").FontSize(11).Bold().TextColor(surface)
 		})
 		ui.Text(c, "漫画翻译器").FontSize(14).Bold().TextColor(ink)
+		ui.Spacer(c).Grow(1)
+		if a.page == pageHome {
+			if ui.Button(c, "设置").Height(32).Padding(0, 16).Clicked() {
+				a.openSettings()
+			}
+		} else {
+			if ui.Button(c, "返回主页").Height(32).Padding(0, 16).Clicked() {
+				a.page = pageHome
+			}
+		}
 	})
 	ui.Row(c).Height(1).Background(line)
 }
@@ -671,6 +698,11 @@ func (a *app) start() {
 		a.invalidate()
 	}
 	in, out := strings.TrimSpace(a.input), strings.TrimSpace(a.output)
+	taskSettings := a.settings
+	if a.settingsError != "" {
+		fail("请先进入设置，修正设置错误。")
+		return
+	}
 	if in == "" {
 		fail("先选择漫画文件。")
 		return
@@ -717,6 +749,32 @@ func (a *app) start() {
 		fail("保存路径是一个文件夹，请选择文件。")
 		return
 	}
+	overwrite := false
+	if _, err := os.Stat(outAbs); err == nil {
+		if taskSettings.Output.Existing == "rename" {
+			outAbs, err = unusedOutput(outAbs)
+			if err != nil {
+				fail("无法生成新的保存文件名。")
+				return
+			}
+		} else {
+			a.mu.Unlock()
+			res, err := mygo.Dialog.Message(mygo.MessageOptions{
+				Parent: a.win, Type: mygo.MessageWarning, Title: "替换已有文件？",
+				Message: "保存位置已有文件。翻译成功后将替换该文件。",
+				Buttons: []string{"取消", "替换"}, DefaultButton: 0, CancelButton: 0,
+			})
+			a.mu.Lock()
+			if err != nil || res.Button != 1 || a.busy {
+				a.mu.Unlock()
+				return
+			}
+			overwrite = true
+		}
+	} else if !os.IsNotExist(err) {
+		fail("无法检查保存位置，请检查文件权限。")
+		return
+	}
 	// A forced kill can leave the atomic-write scratch file and the run log
 	// directory behind. The app runs one job at a time, so clear both before
 	// the next start. The engine repeats this defensively.
@@ -748,7 +806,7 @@ func (a *app) start() {
 	a.mu.Unlock()
 	a.invalidate()
 
-	go a.run(ctx, engine, inAbs, outAbs)
+	go a.run(ctx, engine, inAbs, outAbs, taskSettings, overwrite)
 }
 
 func (a *app) stop() {
@@ -811,8 +869,17 @@ func killTree(pid int) {
 	_ = cmd.Run()
 }
 
-func (a *app) run(ctx context.Context, engine, in, out string) {
-	cmd := exec.Command(engine, "-in", in, "-out", out)
+func (a *app) run(ctx context.Context, engine, in, out string, config settings.Config, overwrite bool) {
+	data, err := json.Marshal(config)
+	if err != nil {
+		a.finish(err)
+		return
+	}
+	args := []string{"-in", in, "-out", out, "-settings-json", string(data)}
+	if overwrite {
+		args = append(args, "-overwrite")
+	}
+	cmd := exec.Command(engine, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: 0x08000000, // CREATE_NO_WINDOW

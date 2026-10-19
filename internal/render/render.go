@@ -114,6 +114,20 @@ type Options struct {
 	TextColor   color.RGBA
 	StrokeColor color.RGBA
 	StrokeWidth float64
+	FontScale   float64
+	Spacing     float64
+	AutoStroke  bool
+}
+
+func ValidateFont(path string) error {
+	_, err := canvas.LoadFontCollection(path, 0, canvas.FontRegular)
+	if err != nil {
+		_, err = canvas.LoadFontFile(path, canvas.FontRegular)
+	}
+	if err != nil {
+		return fmt.Errorf("load font %q: %w", path, err)
+	}
+	return nil
 }
 
 // sortShapedBlocks orders shaped blocks so siblings sharing one balloon mask
@@ -190,6 +204,13 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 	draw.Draw(rgba, rgba.Bounds(), page, bounds.Min, draw.Src)
 
 	min, max := opt.MinSize, opt.MaxSize
+	if opt.FontScale <= 0 {
+		opt.FontScale = 1
+	}
+	if opt.Spacing <= 0 {
+		opt.Spacing = 1
+	}
+	max *= opt.FontScale
 	if min <= 0 {
 		min = 1
 	}
@@ -209,6 +230,10 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 
 	for _, b := range blocks {
 		b.Text = normalize(b.Text)
+		blockOpt := opt
+		if opt.AutoStroke && b.Area == nil {
+			blockOpt.StrokeWidth = 1
+		}
 		if b.Text == "" {
 			continue
 		}
@@ -245,7 +270,7 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 				rt.SetTextOrientation(canvas.Upright)
 			}
 			rt.WriteString(wrapForMode(b.Text, b.Vertical, size, aw, ah))
-			return rt.ToText(aw, ah, canvas.Center, canvas.Center, nil)
+			return rt.ToText(aw, ah, canvas.Center, canvas.Center, &canvas.TextOptions{LineStretch: opt.Spacing - 1})
 		}
 
 		// Largest size whose rendered extent fits. Overflow flags are the
@@ -254,7 +279,7 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 		// original type size instead of growing to fill big regions.
 		ceiling := max
 		if b.SizeHint > 0 {
-			hinted := 1.2 * b.SizeHint
+			hinted := 1.2 * b.SizeHint * opt.FontScale
 			if hinted >= min && hinted < ceiling {
 				ceiling = hinted
 			}
@@ -270,6 +295,9 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 			}
 		}
 		text := layout(lo)
+		if text.OverflowsX || text.OverflowsY {
+			return nil, fmt.Errorf("translation does not fit minimum font size at %v", b.Box)
+		}
 		if text.Empty() {
 			if b.Area != nil {
 				return nil, fmt.Errorf("render shaped block at %v: source box cannot establish a font size", b.Box)
@@ -278,7 +306,7 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 		}
 		if b.Area != nil {
 			occupied := occ[b.Area]
-			err := renderShape(rgba, b, b.Area, bounds, font, blockFill, min, lo, &occupied)
+			err := renderShape(rgba, b, b.Area, bounds, font, blockFill, min, lo, &occupied, blockOpt)
 			occ[b.Area] = occupied
 			if err != nil {
 				return nil, fmt.Errorf("render shaped block at %v: %w", b.Box, err)
@@ -303,6 +331,7 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 		if err != nil {
 			return nil, fmt.Errorf("decode block layer: %w", err)
 		}
+		layer = outlineLayer(layer, blockOpt, blockFill)
 		anchor := b.Anchor
 		if anchor.Empty() {
 			anchor = b.Box
@@ -317,4 +346,42 @@ func Render(page image.Image, blocks []Block, opt Options) (out image.Image, err
 	}
 
 	return rgba, nil
+}
+
+func outlineLayer(src image.Image, opt Options, fill color.Color) image.Image {
+	radius := int(math.Ceil(opt.StrokeWidth))
+	if radius <= 0 {
+		return src
+	}
+	stroke := opt.StrokeColor
+	if stroke.A == 0 {
+		r, g, b, _ := fill.RGBA()
+		stroke = color.RGBA{A: 255}
+		if r+g+b < 3*32768 {
+			stroke.R, stroke.G, stroke.B = 255, 255, 255
+		}
+	}
+	out := image.NewRGBA(src.Bounds())
+	for y := out.Rect.Min.Y; y < out.Rect.Max.Y; y++ {
+		for x := out.Rect.Min.X; x < out.Rect.Max.X; x++ {
+			var alpha uint32
+			for dy := -radius; dy <= radius; dy++ {
+				for dx := -radius; dx <= radius; dx++ {
+					coverage := math.Min(1, math.Max(0, opt.StrokeWidth+1-math.Hypot(float64(dx), float64(dy))))
+					if coverage <= 0 {
+						continue
+					}
+					_, _, _, a := src.At(x+dx, y+dy).RGBA()
+					a = uint32(float64(a) * coverage)
+					if a > alpha {
+						alpha = a
+					}
+				}
+			}
+			a := uint8(alpha >> 8)
+			out.SetRGBA(x, y, color.RGBA{R: uint8(uint16(stroke.R) * uint16(a) / 255), G: uint8(uint16(stroke.G) * uint16(a) / 255), B: uint8(uint16(stroke.B) * uint16(a) / 255), A: a})
+		}
+	}
+	draw.Draw(out, out.Bounds(), src, src.Bounds().Min, draw.Over)
+	return out
 }

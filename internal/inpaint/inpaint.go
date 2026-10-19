@@ -18,10 +18,15 @@ import (
 const side = 512
 
 type Model struct {
-	sess *ort.AdvancedSession
-	img  *ort.Tensor[float32]
-	mask *ort.Tensor[float32]
-	out  *ort.Tensor[float32]
+	sess           *ort.AdvancedSession
+	img            *ort.Tensor[float32]
+	mask           *ort.Tensor[float32]
+	out            *ort.Tensor[float32]
+	ContextPadding int
+	TileSize       int
+	// MaskRadius controls glyph-edge growth, not rectangle expansion.
+	MaskRadius *int
+	MaskLimit  *image.Gray
 }
 
 func Load(path string, cuda bool, vram int64) (*Model, error) {
@@ -106,7 +111,20 @@ func (m *Model) Inpaint(ctx context.Context, src image.Image, textMask *image.Gr
 	if !any(mask) {
 		return rgba, nil
 	}
-	dilated := dilate(mask, w, h, 6)
+	radius := 6
+	if m.MaskRadius != nil {
+		radius = *m.MaskRadius
+	}
+	dilated := dilate(mask, w, h, radius)
+	if m.MaskLimit != nil {
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				if m.MaskLimit.GrayAt(x, y).Y == 0 {
+					dilated[y*w+x] = 0
+				}
+			}
+		}
+	}
 	initialComponents := maskComponents(dilated, w, h)
 	perf.Count(ctx, "inpaint_components", len(initialComponents))
 	for _, component := range initialComponents {
@@ -121,10 +139,14 @@ func (m *Model) Inpaint(ctx context.Context, src image.Image, textMask *image.Gr
 	edges := edgeDistances(dilated, w, h)
 	components := maskComponents(dilated, w, h)
 	bounds := image.Rect(0, 0, w, h)
+	padding := m.ContextPadding
+	if padding <= 0 {
+		padding = 64
+	}
 	var windows []image.Rectangle
 	for _, component := range components {
 		r := component.bounds
-		r = expand(r, 64, w, h).Intersect(bounds)
+		r = expand(r, padding, w, h).Intersect(bounds)
 		if r.Empty() {
 			continue
 		}
@@ -135,7 +157,27 @@ func (m *Model) Inpaint(ctx context.Context, src image.Image, textMask *image.Gr
 		windows = append(windows, parts...)
 	}
 	windows = mergeOverlapping(windows)
+	type repairWindow struct{ read, write image.Rectangle }
+	jobs := make([]repairWindow, 0, len(windows))
 	for _, win := range windows {
+		jobs = append(jobs, repairWindow{win, win})
+	}
+	if m.TileSize > 0 {
+		jobs = nil
+		// TileSize is the source-pixel core. Padding supplies overlapping
+		// context; only the core is written, preventing repeated seam blending.
+		for _, component := range components {
+			win := component.bounds
+			for y := win.Min.Y; y < win.Max.Y; y += m.TileSize {
+				for x := win.Min.X; x < win.Max.X; x += m.TileSize {
+					core := image.Rect(x, y, min(x+m.TileSize, win.Max.X), min(y+m.TileSize, win.Max.Y))
+					jobs = append(jobs, repairWindow{expand(core, padding, w, h), core})
+				}
+			}
+		}
+	}
+	for _, job := range jobs {
+		win := job.read
 		win = win.Intersect(bounds)
 		if win.Empty() {
 			continue
@@ -143,12 +185,12 @@ func (m *Model) Inpaint(ctx context.Context, src image.Image, textMask *image.Gr
 		perf.Count(ctx, "inpaint_windows", 1)
 		if bg, ok := solidBackground(rgba, dilated, w, win); ok {
 			perf.Count(ctx, "inpaint_fills", 1)
-			fillMasked(rgba, dilated, w, win, bg)
+			fillMasked(rgba, dilated, w, job.write, bg)
 			continue
 		}
 		perf.Count(ctx, "inpaint_model_calls", 1)
 		end := perf.ContextSpan(ctx, "nested", "inpaint_window")
-		e := m.inpaintWindow(ctx, rgba, dilated, edges, w, win)
+		e := m.inpaintWindow(ctx, rgba, dilated, edges, w, win, job.write)
 		end(e)
 		if err := e; err != nil {
 			return nil, err
@@ -157,7 +199,7 @@ func (m *Model) Inpaint(ctx context.Context, src image.Image, textMask *image.Gr
 	return rgba, nil
 }
 
-func (m *Model) inpaintWindow(ctx context.Context, src *image.RGBA, mask, edges []uint8, w int, r image.Rectangle) error {
+func (m *Model) inpaintWindow(ctx context.Context, src *image.RGBA, mask, edges []uint8, w int, r image.Rectangle, writeBounds ...image.Rectangle) error {
 	if src == nil || w <= 0 || len(mask) < w {
 		return fmt.Errorf("inpaint: invalid window %v", r)
 	}
@@ -211,16 +253,14 @@ func (m *Model) inpaintWindow(ctx context.Context, src *image.RGBA, mask, edges 
 		return fmt.Errorf("run inpaint model for window %v: %w", r, err)
 	}
 	od := m.out.GetData()
-	for py := 0; py < side; py++ {
-		y := pageY(py)
-		if y < r.Min.Y || y >= r.Max.Y {
-			continue
-		}
-		for px := 0; px < side; px++ {
-			x := pageX(px)
-			if x < r.Min.X || x >= r.Max.X {
-				continue
-			}
+	write := r
+	if len(writeBounds) > 0 {
+		write = write.Intersect(writeBounds[0])
+	}
+	for y := write.Min.Y; y < write.Max.Y; y++ {
+		py := min(side-1, (y-r.Min.Y)*side/r.Dy())
+		for x := write.Min.X; x < write.Max.X; x++ {
+			px := min(side-1, (x-r.Min.X)*side/r.Dx())
 			i := y*w + x
 			if mask[i] == 0 {
 				continue

@@ -16,18 +16,12 @@ import (
 	"strings"
 
 	"mangatrans/internal/llm"
+	"mangatrans/internal/pageimage"
 	"mangatrans/internal/render"
 )
 
 func decodeImage(b []byte) (image.Image, error) {
-	if img, err := png.Decode(bytes.NewReader(b)); err == nil {
-		return img, nil
-	}
-	if img, err := jpeg.Decode(bytes.NewReader(b)); err == nil {
-		return img, nil
-	}
-	img, _, err := image.Decode(bytes.NewReader(b))
-	return img, err
+	return pageimage.Decode(b)
 }
 
 func encodeJPEG(img image.Image, quality int) ([]byte, error) {

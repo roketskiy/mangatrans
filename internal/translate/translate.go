@@ -47,14 +47,15 @@ const systemPrompt = `你是一个专业的日文漫画翻译，把日文对白�
 
 // Client translates batches of blocks through a llama-server.
 type Client struct {
-	srv      *llm.Server
-	glossary map[string]string
+	srv           *llm.Server
+	glossary      map[string]string
+	BatchAttempts int
 }
 
 // New wraps a running llama-server. glossary maps source terms to the exact
 // Chinese wording the translation must use; it may be nil.
 func New(srv *llm.Server, glossary map[string]string) *Client {
-	return &Client{srv: srv, glossary: glossary}
+	return &Client{srv: srv, glossary: glossary, BatchAttempts: 2}
 }
 
 // TranslateBatch sends one batch and parses the JSON reply. Blocks the model
@@ -70,7 +71,7 @@ func (c *Client) TranslateBatch(ctx context.Context, blocks []Block) (Result, er
 	pending := append([]Block(nil), blocks...)
 	var lastErr error
 
-	for attempt := 0; attempt < 2 && len(pending) > 0; attempt++ {
+	for attempt := 0; attempt < max(1, min(c.BatchAttempts, 5)) && len(pending) > 0; attempt++ {
 		req := struct {
 			Blocks []Block `json:"blocks"`
 		}{Blocks: pending}
@@ -84,7 +85,11 @@ func (c *Client) TranslateBatch(ctx context.Context, blocks []Block) (Result, er
 		}
 		content, err := c.srv.ChatJSON(ctx, msgs, batchSchema, 0.0, 4096)
 		if err != nil {
-			return nil, fmt.Errorf("translate request: %w", err)
+			lastErr = fmt.Errorf("translate request: %w", err)
+			if ctx.Err() != nil {
+				break
+			}
+			continue
 		}
 		got := parseLoose(content)
 		next := pending[:0]

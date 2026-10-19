@@ -34,7 +34,11 @@ type shapePlacement struct {
 // the rendered ink cannot cross the supplied alpha mask. Lane windows also
 // avoid the rectangles already handed to sibling dialogues sharing this
 // bubble shape; occupied grows by this dialogue's window on success.
-func renderShape(dst *image.RGBA, b Block, mask *image.Alpha, pageBounds image.Rectangle, font *canvas.Font, fill color.Color, min, max float64, occupied *[]image.Rectangle) error {
+func renderShape(dst *image.RGBA, b Block, mask *image.Alpha, pageBounds image.Rectangle, font *canvas.Font, fill color.Color, min, max float64, occupied *[]image.Rectangle, options ...Options) error {
+	opt := Options{Spacing: 1}
+	if len(options) > 0 {
+		opt = options[0]
+	}
 	runes := []rune(b.Text)
 	if len(runes) == 0 {
 		return nil
@@ -56,14 +60,14 @@ func renderShape(dst *image.RGBA, b Block, mask *image.Alpha, pageBounds image.R
 	}
 	var placements []shapePlacement
 	for size := max; size > min; size -= 0.5 {
-		if p, ok := shapeLayout(mask, mb, runes, b.Vertical, font, fill, size, anchor, *occupied); ok {
+		if p, ok := shapeLayout(mask, mb, runes, b.Vertical, font, fill, size, anchor, *occupied, opt.Spacing); ok {
 			placements = p
 			break
 		}
 	}
 	if len(placements) == 0 {
 		var ok bool
-		placements, ok = shapeLayout(mask, mb, runes, b.Vertical, font, fill, min, anchor, *occupied)
+		placements, ok = shapeLayout(mask, mb, runes, b.Vertical, font, fill, min, anchor, *occupied, opt.Spacing)
 		if !ok || len(placements) == 0 {
 			return fmt.Errorf("translation does not fit safe area at minimum size %.2f", min)
 		}
@@ -87,6 +91,7 @@ func renderShape(dst *image.RGBA, b Block, mask *image.Alpha, pageBounds image.R
 		if err != nil {
 			return fmt.Errorf("decode shape lane: %w", err)
 		}
+		layer = outlineLayer(layer, opt, fill)
 		d := image.Rect(r.Min.X-pageBounds.Min.X, r.Min.Y-pageBounds.Min.Y,
 			r.Max.X-pageBounds.Min.X, r.Max.Y-pageBounds.Min.Y)
 		draw.Draw(dst, d, layer, image.Point{}, draw.Over)
@@ -131,9 +136,13 @@ func opaqueBounds(mask *image.Alpha) image.Rectangle {
 // also dodge the occupied rectangles of sibling dialogues already placed on
 // this bubble; the constraint relaxes stepwise so a crowded balloon still
 // lays out rather than failing outright.
-func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertical bool, font *canvas.Font, fill color.Color, size float64, anchor image.Rectangle, occupied []image.Rectangle) ([]shapePlacement, bool) {
+func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertical bool, font *canvas.Font, fill color.Color, size float64, anchor image.Rectangle, occupied []image.Rectangle, spacing ...float64) ([]shapePlacement, bool) {
 	fontPx := size * shapePtToMM / pxToMM
-	thickness := int(math.Ceil(fontPx * 1.55))
+	gap := 1.0
+	if len(spacing) > 0 && spacing[0] > 0 {
+		gap = spacing[0]
+	}
+	thickness := int(math.Ceil(fontPx * 1.55 * gap))
 	if thickness < 4 {
 		thickness = 4
 	}

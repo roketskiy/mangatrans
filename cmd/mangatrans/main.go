@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -8,6 +9,7 @@ import (
 	"image"
 	"image/color"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime/pprof"
@@ -20,10 +22,12 @@ import (
 	"mangatrans/internal/infer"
 	"mangatrans/internal/inpaint"
 	"mangatrans/internal/llm"
+	"mangatrans/internal/pageimage"
 	"mangatrans/internal/perf"
 	"mangatrans/internal/render"
 	"mangatrans/internal/segment"
 	"mangatrans/internal/translate"
+	"mangatrans/settings"
 )
 
 type paths struct {
@@ -50,6 +54,7 @@ func run() (err error) {
 	perfStarted := perf.Now()
 	in := flag.String("in", "", "input .cbz/.zip")
 	out := flag.String("out", "", "output .cbz")
+	overwrite := flag.Bool("overwrite", false, "replace an existing output after explicit confirmation")
 	work := flag.String("work", "", "scratch dir for debug images")
 	limit := flag.Int("limit", 0, "process only the first N pages (0 = all)")
 	conf := flag.Float64("conf", 0.35, "detection confidence threshold")
@@ -62,7 +67,65 @@ func run() (err error) {
 	cpuProfile := flag.String("cpu-profile", "", "write CPU profile; use a separate diagnostic run")
 	ocrWorkers := flag.Int("ocr-workers", 1, "concurrent OCR requests (1-4); ONNX sessions stay serial")
 	batchPages := flag.Int("mt-batch-pages", 2, "maximum consecutive pages sharing one 12-block translation batch")
+	settingsPath := flag.String("settings", "", "settings JSON file")
+	settingsJSON := flag.String("settings-json", "", "immutable settings JSON snapshot")
 	flag.Parse()
+	cfg := settings.Default()
+	fileSettings, jsonSettings := false, false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "settings" {
+			fileSettings = true
+		}
+		if f.Name == "settings-json" {
+			jsonSettings = true
+		}
+	})
+	if fileSettings && jsonSettings {
+		return fmt.Errorf("settings and settings-json are mutually exclusive")
+	}
+	if fileSettings {
+		if *settingsPath == "" {
+			return fmt.Errorf("settings path must not be empty")
+		}
+		cfg, err = settings.Load(*settingsPath)
+	}
+	if jsonSettings {
+		cfg, err = settings.Parse(strings.NewReader(*settingsJSON))
+	}
+	if err != nil {
+		return err
+	}
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "font":
+			cfg.Layout.FontPath = *fontPath
+		case "text-direction":
+			cfg.Layout.Direction = *directionFlag
+		case "mt-model":
+			cfg.Translation.ModelPath = *mtModel
+		case "mt-batch-pages":
+			cfg.Processing.BatchPages = *batchPages
+		case "conf":
+			cfg.Recognition.Confidence = *conf
+		case "work":
+			cfg.Output.SaveDiagnostics = *work != ""
+		}
+	})
+	if err = cfg.Validate(); err != nil {
+		return err
+	}
+	if cfg.Layout.FontPath != "" {
+		*fontPath = cfg.Layout.FontPath
+	}
+	if cfg.Translation.ModelPath != "" {
+		*mtModel = cfg.Translation.ModelPath
+	}
+	*directionFlag = cfg.Layout.Direction
+	*batchPages = cfg.Processing.BatchPages
+	*conf = cfg.Recognition.Confidence
+	if math.IsNaN(*conf) || *conf <= 0 || *conf > 1 {
+		return fmt.Errorf("conf must be in (0,1]")
+	}
 	direction, directionErr := render.ParseDirection(*directionFlag)
 	if directionErr != nil {
 		return directionErr
@@ -108,6 +171,14 @@ func run() (err error) {
 	if st, err := os.Stat(outAbs); err == nil && st.IsDir() {
 		return fmt.Errorf("output path is a directory")
 	}
+	cacheBase := outAbs
+	if !*overwrite {
+		outAbs, err = availableOutput(outAbs, cfg.Output.Existing)
+		if err != nil {
+			return err
+		}
+	}
+	*out = outAbs
 	started := time.Now()
 	b := &bench{}
 
@@ -123,14 +194,29 @@ func run() (err error) {
 		cudaDir:        envOr("MANGATRANS_CUDA_DIR", `E:\Python312\Lib\site-packages\torch\lib`),
 		fontPath:       *fontPath,
 	}
+	if err := validatePaths(p); err != nil {
+		return err
+	}
 	trace.FilesUsed(map[string]string{
 		"llama_server": p.llamaExe, "ocr_model": p.ocrModel, "mmproj": p.ocrMMProj,
 		"translation_model": p.mtModel, "detector": p.detModel, "inpaint_model": p.lapModel,
 		"font": p.fontPath, "ort": filepath.Join(p.ortDir, "onnxruntime.dll"),
 	})
 
+	if !cfg.Output.SaveDiagnostics {
+		*work = ""
+	} else if *work == "" {
+		*work = outAbs + ".work"
+	}
 	if *work != "" {
-		_ = os.MkdirAll(*work, 0o755)
+		if err := os.MkdirAll(*work, 0755); err != nil {
+			return err
+		}
+		diagnosticDir, e := os.MkdirTemp(*work, "run-")
+		if e != nil {
+			return e
+		}
+		*work = diagnosticDir
 	}
 
 	tRead := time.Now()
@@ -159,14 +245,15 @@ func run() (err error) {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return fmt.Errorf("create output directory: %w", err)
 	}
-	runDir := filepath.Join(outDir, "."+filepath.Base(outAbs)+".mangatrans")
-	// A forced kill or power loss can leave this directory behind. The UI
-	// allows only one run at a time, so the next run may safely replace it.
-	_ = os.RemoveAll(runDir)
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
+	runDir, err := os.MkdirTemp(outDir, "."+filepath.Base(outAbs)+".mangatrans-")
+	if err != nil {
 		return fmt.Errorf("create run temp dir: %w", err)
 	}
 	defer os.RemoveAll(runDir)
+	logDir := runDir
+	if *work != "" {
+		logDir = *work
+	}
 	// Keep the run directory clean, but show the last server lines in the
 	// main log before deleting it. Otherwise a start failure only points at a
 	// log file that no longer exists by the time the user opens it.
@@ -175,7 +262,7 @@ func run() (err error) {
 			return
 		}
 		for _, name := range []string{"ocr.log", "mt.log"} {
-			if tail := readTail(filepath.Join(runDir, name), 24); tail != "" {
+			if tail := readTail(filepath.Join(logDir, name), 24); tail != "" {
 				log.Printf("--- %s (last lines) ---\n%s", name, tail)
 			}
 		}
@@ -184,288 +271,351 @@ func run() (err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
 	ctx = perf.WithRecorder(ctx, trace)
-
-	// Stage A: OCR. One llama-server instance, then released so the
-	// translation model can take the same VRAM.
-	log.Printf("starting OCR server")
-	tLoad := time.Now()
-	endSpan = trace.Span("operation", "load_ocr", -1, -1)
-	ocrSrv, err := llm.Start(ctx, llm.Config{
-		Exe: p.llamaExe, Model: p.ocrModel, MMProj: p.ocrMMProj,
-		LogPath: filepath.Join(runDir, "ocr.log"),
-		Args:    []string{"-ngl", "99", "-c", "4096", "--temp", "0", "--jinja"},
-	})
-	endSpan(err)
-	if err != nil {
-		return fmt.Errorf("start OCR server: %w", err)
+	cacheDir := filepath.Join(filepath.Dir(cacheBase), "."+filepath.Base(cacheBase)+".mangatrans-cache")
+	cacheKey, keyErr := inferenceKey(p, cfg, *conf, pages, *glossaryPath)
+	cachePath := filepath.Join(cacheDir, cacheKey+".json.gz")
+	var results []*pageResult
+	if cfg.Processing.ReuseResults && keyErr == nil {
+		if cached, e := loadInference(cachePath, cacheKey, len(pages)); e == nil {
+			results = cached
+			log.Printf("reused recognition and translation for %d pages", len(results))
+		}
 	}
-	// Kill is idempotent. Register it so every error path also stops the
-	// server, even before the normal OCR stage has finished.
-	defer func() {
-		end := trace.Span("operation", "cleanup_ocr", -1, -1)
-		ocrSrv.Kill()
-		end(nil)
-	}()
-	b.LoadOCRMS = time.Since(tLoad).Milliseconds()
-
-	endSpan = trace.Span("operation", "init_runtime", -1, -1)
 	rt, err := infer.Env(p.ortDir, p.cudaDir)
-	endSpan(err)
 	if err != nil {
 		return fmt.Errorf("init onnxruntime: %w", err)
 	}
-	defer func() {
-		end := trace.Span("operation", "cleanup_runtime", -1, -1)
-		end(rt.Destroy())
-	}()
+	defer rt.Destroy()
+	if results == nil {
 
-	tLoad = time.Now()
-	endSpan = trace.Span("operation", "load_detect", -1, -1)
-	det, err := detect.Load(p.detModel, true, 3<<30)
-	endSpan(err)
-	if err != nil {
-		return fmt.Errorf("load detector: %w", err)
-	}
-	b.LoadDetMS = time.Since(tLoad).Milliseconds()
-	detOpen := true
-	closeDetector := func() {
-		if !detOpen {
-			return
-		}
-		detOpen = false
-		end := trace.Span("operation", "unload_detect", -1, -1)
-		end(det.Close())
-	}
-	defer closeDetector()
-	results := make([]*pageResult, 0, len(pages))
-
-	// Optional bubble segmenter: instance masks replace the white-interior
-	// heuristic for layout areas and split boxes at balloon boundaries.
-	var segModel *segment.Model
-	if p.bubbleSegModel != "" {
-		endSpan = trace.Span("operation", "load_bubble_seg", -1, -1)
-		segModel, err = segment.Load(p.bubbleSegModel, true, 3<<30, 1600)
+		// Stage A: OCR. One llama-server instance, then released so the
+		// translation model can take the same VRAM.
+		log.Printf("starting OCR server")
+		tLoad := time.Now()
+		endSpan = trace.Span("operation", "load_ocr", -1, -1)
+		ocrSrv, err := llm.Start(ctx, llm.Config{
+			Exe: p.llamaExe, Model: p.ocrModel, MMProj: p.ocrMMProj,
+			LogPath: filepath.Join(logDir, "ocr.log"),
+			Args:    []string{"-ngl", "99", "-c", "4096", "--temp", "0", "--jinja"},
+		})
 		endSpan(err)
 		if err != nil {
-			return fmt.Errorf("load bubble segmenter: %w", err)
+			return fmt.Errorf("start OCR server: %w", err)
 		}
+		// Kill is idempotent. Register it so every error path also stops the
+		// server, even before the normal OCR stage has finished.
 		defer func() {
-			end := trace.Span("operation", "unload_bubble_seg", -1, -1)
-			end(segModel.Close())
+			end := trace.Span("operation", "cleanup_ocr", -1, -1)
+			ocrSrv.Kill()
+			end(nil)
 		}()
-		log.Printf("bubble segmenter: %s", p.bubbleSegModel)
-	}
+		b.LoadOCRMS = time.Since(tLoad).Milliseconds()
 
-	detParams := detect.DefaultParams()
-	detParams.ConfThreshold = float32(*conf)
-
-	ocrStart := time.Now()
-	for i, pg := range pages {
-		log.Printf("progress ocr %d/%d", i+1, len(pages))
-		tDecode := time.Now()
-		endSpan = trace.Span("operation", "decode", i, -1)
-		img, err := decodeImage(pg.Bytes)
+		tLoad = time.Now()
+		endSpan = trace.Span("operation", "load_detect", -1, -1)
+		det, err := detect.Load(p.detModel, true, 3<<30)
 		endSpan(err)
 		if err != nil {
-			pageMetrics[i].Outcome = "decode_failed"
-			log.Printf("page %d (%s): decode failed: %v", i, pg.Name, err)
-			continue
+			return fmt.Errorf("load detector: %w", err)
 		}
-		b.DecodeMS += time.Since(tDecode).Milliseconds()
-		pageMetrics[i].Width, pageMetrics[i].Height = img.Bounds().Dx(), img.Bounds().Dy()
-		tDetect := time.Now()
-		endSpan = trace.Span("operation", "detect", i, -1)
-		res, err := det.Run(img, detParams)
-		endSpan(err)
-		if err != nil {
-			pageMetrics[i].Outcome = "detect_failed"
-			log.Printf("page %d: detect failed: %v", i, err)
-			continue
+		b.LoadDetMS = time.Since(tLoad).Milliseconds()
+		detOpen := true
+		closeDetector := func() {
+			if !detOpen {
+				return
+			}
+			detOpen = false
+			end := trace.Span("operation", "unload_detect", -1, -1)
+			end(det.Close())
 		}
-		b.DetectMS += time.Since(tDetect).Milliseconds()
-		pageMetrics[i].Detected = len(res.Boxes)
-		endSpan = trace.Span("operation", "split_dialogues", i, -1)
-		parentBoxes := make([]image.Rectangle, len(res.Boxes))
-		for j, box := range res.Boxes {
-			parentBoxes[j] = image.Rect(int(box.X), int(box.Y), int(box.X+box.W), int(box.Y+box.H))
-		}
-		var balloons []bubble.Balloon
-		if segModel != nil {
-			found, err := segModel.Run(img, segment.DefaultParams())
+		defer closeDetector()
+		results = make([]*pageResult, 0, len(pages))
+
+		// Optional bubble segmenter: instance masks replace the white-interior
+		// heuristic for layout areas and split boxes at balloon boundaries.
+		var segModel *segment.Model
+		if p.bubbleSegModel != "" {
+			endSpan = trace.Span("operation", "load_bubble_seg", -1, -1)
+			segModel, err = segment.Load(p.bubbleSegModel, true, 3<<30, 1600)
+			endSpan(err)
 			if err != nil {
-				log.Printf("page %d: bubble segmentation failed, using geometric splitters: %v", i, err)
+				return fmt.Errorf("load bubble segmenter: %w", err)
 			}
-			for _, bub := range found {
-				balloons = append(balloons, bubble.Balloon{Box: bub.Box, Mask: bub.Mask})
+			defer func() {
+				end := trace.Span("operation", "unload_bubble_seg", -1, -1)
+				end(segModel.Close())
+			}()
+			log.Printf("bubble segmenter: %s", p.bubbleSegModel)
+		}
+
+		detParams := detect.DefaultParams()
+		detParams.ConfThreshold = float32(*conf)
+
+		ocrStart := time.Now()
+		for i, pg := range pages {
+			log.Printf("progress ocr %d/%d", i+1, len(pages))
+			tDecode := time.Now()
+			endSpan = trace.Span("operation", "decode", i, -1)
+			img, err := decodeImage(pg.Bytes)
+			endSpan(err)
+			if err != nil {
+				pageMetrics[i].Outcome = "decode_failed"
+				log.Printf("page %d (%s): decode failed: %v", i, pg.Name, err)
+				continue
 			}
+			b.DecodeMS += time.Since(tDecode).Milliseconds()
+			pageMetrics[i].Width, pageMetrics[i].Height = img.Bounds().Dx(), img.Bounds().Dy()
+			tDetect := time.Now()
+			endSpan = trace.Span("operation", "detect", i, -1)
+			var res *detect.Result
+			if cfg.Recognition.TileSize > 0 {
+				res, err = det.RunTiled(img, detParams, cfg.Recognition.TileSize)
+			} else {
+				res, err = det.Run(img, detParams)
+			}
+			endSpan(err)
+			if err != nil {
+				pageMetrics[i].Outcome = "detect_failed"
+				log.Printf("page %d: detect failed: %v", i, err)
+				continue
+			}
+			b.DetectMS += time.Since(tDetect).Milliseconds()
+			pageMetrics[i].Detected = len(res.Boxes)
+			endSpan = trace.Span("operation", "split_dialogues", i, -1)
+			parentBoxes := make([]image.Rectangle, len(res.Boxes))
+			for j, box := range res.Boxes {
+				parentBoxes[j] = image.Rect(int(box.X), int(box.Y), int(box.X+box.W), int(box.Y+box.H))
+			}
+			var balloons []bubble.Balloon
+			if segModel != nil {
+				found, err := segModel.Run(img, segment.DefaultParams())
+				if err != nil {
+					log.Printf("page %d: bubble segmentation failed, using geometric splitters: %v", i, err)
+				}
+				for _, bub := range found {
+					balloons = append(balloons, bubble.Balloon{Box: bub.Box, Mask: bub.Mask})
+				}
+			}
+			var regions []bubble.TextRegion
+			if len(balloons) > 0 {
+				regions = bubble.SplitWithBubbles(img, res.Mask, balloons, parentBoxes)
+			} else {
+				regions = bubble.SplitTextRegions(img, res.Mask, parentBoxes)
+			}
+			pageMetrics[i].OCRRegions = len(regions)
+			endSpan(nil)
+
+			pr := &pageResult{index: i, mask: res.Mask}
+			endOCRPage := trace.Span("operation", "ocr_page", i, -1)
+			ocrResults := recognizeRegions(perf.WithLocation(ctx, i, -1), img, regions, *ocrWorkers,
+				func(ctx context.Context, crop image.Image) (string, error) { return ocrBox(ctx, ocrSrv, crop) })
+			for j, got := range ocrResults {
+				region := regions[j]
+				if got.cropSkipped {
+					pageMetrics[i].CropSkipped++
+					continue
+				}
+				b.OCRMS += got.durationNS / 1e6
+				b.OCRBoxes++
+				if got.err != nil {
+					log.Printf("page %d box %d: ocr failed: %v", i, j, got.err)
+					pageMetrics[i].OCRFailed++
+					continue
+				}
+				text := cleanOCR(got.text)
+				if text == "" || isNoise(text) {
+					pageMetrics[i].OCRRejected++
+					continue
+				}
+				pr.blocks = append(pr.blocks, render.Block{
+					Box:        region.Box,
+					Area:       region.Area,
+					SourceArea: region.CropMask,
+					Vertical:   direction.IsVertical(region.Box.Dy() > region.Box.Dx()),
+					Anchor:     region.Box,
+					SizeHint:   estimateFontSize(res.Mask, region.Box, len([]rune(text))),
+				})
+				pr.ocr = append(pr.ocr, text)
+				pageMetrics[i].OCRAccepted++
+			}
+			endOCRPage(nil)
+			if pageMetrics[i].OCRFailed > 0 || pageMetrics[i].CropSkipped > 0 {
+				pageMetrics[i].Outcome = "ocr_failed"
+				continue
+			}
+			log.Printf("page %d: %d detector boxes, %d dialogue regions, %d with text", i, len(res.Boxes), len(regions), len(pr.ocr))
+			results = append(results, pr)
 		}
-		var regions []bubble.TextRegion
-		if len(balloons) > 0 {
-			regions = bubble.SplitWithBubbles(img, res.Mask, balloons, parentBoxes)
-		} else {
-			regions = bubble.SplitTextRegions(img, res.Mask, parentBoxes)
-		}
-		pageMetrics[i].OCRRegions = len(regions)
+		endSpan = trace.Span("operation", "unload_ocr", -1, -1)
+		ocrSrv.Kill()
 		endSpan(nil)
+		closeDetector()
+		log.Printf("progress ocr %d/%d", len(pages), len(pages))
+		log.Printf("OCR done in %s", time.Since(ocrStart).Round(time.Second))
 
-		pr := &pageResult{index: i, mask: res.Mask}
-		endOCRPage := trace.Span("operation", "ocr_page", i, -1)
-		ocrResults := recognizeRegions(perf.WithLocation(ctx, i, -1), img, regions, *ocrWorkers,
-			func(ctx context.Context, crop image.Image) (string, error) { return ocrBox(ctx, ocrSrv, crop) })
-		for j, got := range ocrResults {
-			region := regions[j]
-			if got.cropSkipped {
-				pageMetrics[i].CropSkipped++
-				continue
-			}
-			b.OCRMS += got.durationNS / 1e6
-			b.OCRBoxes++
-			if got.err != nil {
-				log.Printf("page %d box %d: ocr failed: %v", i, j, got.err)
-				pageMetrics[i].OCRFailed++
-				continue
-			}
-			text := cleanOCR(got.text)
-			if text == "" || isNoise(text) {
-				pageMetrics[i].OCRRejected++
-				continue
-			}
-			pr.blocks = append(pr.blocks, render.Block{
-				Box:        region.Box,
-				Area:       region.Area,
-				SourceArea: region.CropMask,
-				Vertical:   direction.IsVertical(region.Box.Dy() > region.Box.Dx()),
-				Anchor:     region.Box,
-				SizeHint:   estimateFontSize(res.Mask, region.Box, len([]rune(text))),
-			})
-			pr.ocr = append(pr.ocr, text)
-			pageMetrics[i].OCRAccepted++
-		}
-		endOCRPage(nil)
-		log.Printf("page %d: %d detector boxes, %d dialogue regions, %d with text", i, len(res.Boxes), len(regions), len(pr.ocr))
-		results = append(results, pr)
-	}
-	endSpan = trace.Span("operation", "unload_ocr", -1, -1)
-	ocrSrv.Kill()
-	endSpan(nil)
-	closeDetector()
-	log.Printf("progress ocr %d/%d", len(pages), len(pages))
-	log.Printf("OCR done in %s", time.Since(ocrStart).Round(time.Second))
-
-	// Stage B: translation, batched across pages so the model sees context.
-	log.Printf("starting translation server")
-	tLoad = time.Now()
-	endSpan = trace.Span("operation", "load_translate", -1, -1)
-	mtSrv, err := llm.Start(ctx, llm.Config{
-		Exe: p.llamaExe, Model: p.mtModel,
-		LogPath: filepath.Join(runDir, "mt.log"),
-		Args:    []string{"-ngl", "99", "-c", "8192", "--jinja"},
-	})
-	endSpan(err)
-	if err != nil {
-		return fmt.Errorf("start translation server: %w", err)
-	}
-	b.LoadMTMS = time.Since(tLoad).Milliseconds()
-	defer func() {
-		end := trace.Span("operation", "cleanup_translate", -1, -1)
-		mtSrv.Kill()
-		end(nil)
-	}()
-
-	var glossary map[string]string
-	if *glossaryPath != "" {
-		glossary, err = translate.LoadGlossary(*glossaryPath)
+		// Stage B: translation, batched across pages so the model sees context.
+		log.Printf("starting translation server")
+		tLoad = time.Now()
+		endSpan = trace.Span("operation", "load_translate", -1, -1)
+		mtSrv, err := llm.Start(ctx, llm.Config{
+			Exe: p.llamaExe, Model: p.mtModel,
+			LogPath: filepath.Join(logDir, "mt.log"),
+			Args:    []string{"-ngl", "99", "-c", "8192", "--jinja"},
+		})
+		endSpan(err)
 		if err != nil {
-			return fmt.Errorf("load glossary: %w", err)
+			return fmt.Errorf("start translation server: %w", err)
 		}
-		log.Printf("glossary: %d terms", len(glossary))
-	}
+		b.LoadMTMS = time.Since(tLoad).Milliseconds()
+		defer func() {
+			end := trace.Span("operation", "cleanup_translate", -1, -1)
+			mtSrv.Kill()
+			end(nil)
+		}()
 
-	tr := translate.New(mtSrv, glossary)
-	const perBatch = 12
-	mtStart := time.Now()
+		var glossary map[string]string
+		if *glossaryPath != "" {
+			glossary, err = translate.LoadGlossary(*glossaryPath)
+			if err != nil {
+				return fmt.Errorf("load glossary: %w", err)
+			}
+			log.Printf("glossary: %d terms", len(glossary))
+		}
+
+		tr := translate.New(mtSrv, glossary)
+		tr.BatchAttempts = cfg.Translation.BatchAttempts
+		const perBatch = 12
+		mtStart := time.Now()
+		byIndex := make(map[int]*pageResult, len(results))
+		for _, pr := range results {
+			byIndex[pr.index] = pr
+		}
+		for batchIndex, batch := range planTranslations(results, perBatch, *batchPages) {
+			first := batch.locations[batch.blocks[0].ID]
+			log.Printf("progress translate %d/%d", first.page+1, len(pages))
+			tTr := time.Now()
+			endSpan = trace.Span("operation", "translate_batch", -1, batchIndex)
+			got, err := tr.TranslateBatch(perf.WithLocation(ctx, -1, batchIndex), batch.blocks)
+			endSpan(err)
+			b.TranslateMS += time.Since(tTr).Milliseconds()
+			b.TranslateBlocks += len(batch.blocks)
+			if err != nil {
+				log.Printf("batch %d: translate failed: %v", batchIndex, err)
+				continue
+			}
+			for id, txt := range got {
+				if loc, ok := batch.locations[id]; ok && txt != "" {
+					byIndex[loc.page].blocks[loc.block].Text = txt
+				}
+			}
+		}
+		// Single-line retry for blocks the batch model left empty. Name lists and
+		// lines that begin with ellipses often trigger an empty string, and
+		// keeping the Japanese there is worse than one extra request.
+		retries := 0
+		for _, pr := range results {
+			for k := range pr.blocks {
+				if pr.blocks[k].Text != "" {
+					continue
+				}
+				tRetry := time.Now()
+				endSpan = trace.Span("operation", "translate_retry", pr.index, k)
+				attempts := 1
+				var txt string
+				var err error
+				for attempt := 0; attempt < attempts; attempt++ {
+					txt, err = tr.TranslateOne(perf.WithLocation(ctx, pr.index, k), pr.ocr[k])
+					if err == nil && !translate.Untranslated(pr.ocr[k], txt) {
+						break
+					}
+					if ctx.Err() != nil {
+						break
+					}
+				}
+				endSpan(err)
+				b.TranslateMS += time.Since(tRetry).Milliseconds()
+				if err != nil {
+					log.Printf("page %d block %d: single retry failed: %v", pr.index, k+1, err)
+					continue
+				}
+				if !translate.Untranslated(pr.ocr[k], txt) {
+					pr.blocks[k].Text = txt
+					retries++
+				}
+			}
+		}
+		log.Printf("single-line retries: %d", retries)
+		for _, pr := range results {
+			for _, blk := range pr.blocks {
+				if blk.Text != "" {
+					pageMetrics[pr.index].Translated++
+					b.Blocks++
+					b.Chars += len([]rune(blk.Text))
+				}
+			}
+		}
+
+		log.Printf("progress translate %d/%d", len(pages), len(pages))
+		log.Printf("translation done in %s", time.Since(mtStart).Round(time.Second))
+		skipped := 0
+		for _, pr := range results {
+			n := 0
+			for _, b := range pr.blocks {
+				if b.Text != "" {
+					n++
+				}
+			}
+			skipped += len(pr.blocks) - n
+			log.Printf("page %d: translated %d/%d blocks", pr.index, n, len(pr.blocks))
+		}
+		if skipped > 0 {
+			log.Printf("warning: %d text blocks kept the original text", skipped)
+		}
+		endSpan = trace.Span("operation", "unload_translate", -1, -1)
+		mtSrv.Kill()
+		endSpan(nil)
+		cacheComplete := len(results) == len(pages)
+		for _, pr := range results {
+			if pageMetrics[pr.index].OCRFailed > 0 {
+				cacheComplete = false
+			}
+			for _, blk := range pr.blocks {
+				if blk.Text == "" {
+					cacheComplete = false
+				}
+			}
+		}
+		if keyErr == nil && cacheComplete {
+			if e := atomicJSON(cachePath, recordFor(cacheKey, results), true); e != nil {
+				log.Printf("cache save skipped: %v", e)
+			}
+		}
+	}
 	byIndex := make(map[int]*pageResult, len(results))
 	for _, pr := range results {
 		byIndex[pr.index] = pr
-	}
-	for batchIndex, batch := range planTranslations(results, perBatch, *batchPages) {
-		first := batch.locations[batch.blocks[0].ID]
-		log.Printf("progress translate %d/%d", first.page+1, len(pages))
-		tTr := time.Now()
-		endSpan = trace.Span("operation", "translate_batch", -1, batchIndex)
-		got, err := tr.TranslateBatch(perf.WithLocation(ctx, -1, batchIndex), batch.blocks)
-		endSpan(err)
-		b.TranslateMS += time.Since(tTr).Milliseconds()
-		b.TranslateBlocks += len(batch.blocks)
-		if err != nil {
-			log.Printf("batch %d: translate failed: %v", batchIndex, err)
-			continue
-		}
-		for id, txt := range got {
-			if loc, ok := batch.locations[id]; ok && txt != "" {
-				byIndex[loc.page].blocks[loc.block].Text = txt
-			}
-		}
-	}
-	// Single-line retry for blocks the batch model left empty. Name lists and
-	// lines that begin with ellipses often trigger an empty string, and
-	// keeping the Japanese there is worse than one extra request.
-	retries := 0
-	for _, pr := range results {
 		for k := range pr.blocks {
-			if pr.blocks[k].Text != "" {
-				continue
-			}
-			tRetry := time.Now()
-			endSpan = trace.Span("operation", "translate_retry", pr.index, k)
-			txt, err := tr.TranslateOne(perf.WithLocation(ctx, pr.index, k), pr.ocr[k])
-			endSpan(err)
-			b.TranslateMS += time.Since(tRetry).Milliseconds()
-			if err != nil {
-				log.Printf("page %d block %d: single retry failed: %v", pr.index, k+1, err)
-				continue
-			}
-			if !translate.Untranslated(pr.ocr[k], txt) {
-				pr.blocks[k].Text = txt
-				retries++
-			}
+			pr.blocks[k].Vertical = direction.IsVertical(pr.blocks[k].Box.Dy() > pr.blocks[k].Box.Dx())
 		}
 	}
-	log.Printf("single-line retries: %d", retries)
-	for _, pr := range results {
-		for _, blk := range pr.blocks {
-			if blk.Text != "" {
-				pageMetrics[pr.index].Translated++
-				b.Blocks++
-				b.Chars += len([]rune(blk.Text))
-			}
+	if cfg.Output.SaveEditable {
+		editable, e := availableOutput(outAbs+".editable.json", "rename")
+		if e != nil {
+			return e
+		}
+		if e = atomicJSON(editable, struct {
+			Inference inferenceRecord `json:"inference"`
+			Layout    settings.Layout `json:"layout"`
+			Sources   []string        `json:"sources"`
+		}{recordFor(cacheKey, results), cfg.Layout, pageNames(pages)}, false); e != nil {
+			return fmt.Errorf("save editable: %w", e)
 		}
 	}
-
-	log.Printf("progress translate %d/%d", len(pages), len(pages))
-	log.Printf("translation done in %s", time.Since(mtStart).Round(time.Second))
-	skipped := 0
-	for _, pr := range results {
-		n := 0
-		for _, b := range pr.blocks {
-			if b.Text != "" {
-				n++
-			}
-		}
-		skipped += len(pr.blocks) - n
-		log.Printf("page %d: translated %d/%d blocks", pr.index, n, len(pr.blocks))
-	}
-	if skipped > 0 {
-		log.Printf("warning: %d text blocks kept the original text", skipped)
-	}
-	endSpan = trace.Span("operation", "unload_translate", -1, -1)
-	mtSrv.Kill()
-	endSpan(nil)
 
 	// Stage C: erase original text, then draw translations.
 	log.Printf("starting inpainting")
 	log.Printf("progress inpaint 0/%d", len(pages))
-	tLoad = time.Now()
+	tLoad := time.Now()
 	endSpan = trace.Span("operation", "load_inpaint", -1, -1)
 	lap, err := inpaint.Load(p.lapModel, true, 3<<30)
 	endSpan(err)
@@ -473,6 +623,10 @@ func run() (err error) {
 		return fmt.Errorf("load inpaint model: %w", err)
 	}
 	b.LoadLamaMS = time.Since(tLoad).Milliseconds()
+	lap.ContextPadding = cfg.Repair.ContextPadding
+	lap.TileSize = cfg.Repair.TileSize
+	radius := cfg.Repair.MaskDilation
+	lap.MaskRadius = &radius
 	defer func() {
 		end := trace.Span("operation", "cleanup_inpaint", -1, -1)
 		end(lap.Close())
@@ -484,6 +638,16 @@ func run() (err error) {
 		MaxSize:   18.0,
 		Padding:   3,
 		TextColor: color.RGBA{A: 255},
+	}
+	renderOpt.FontScale = cfg.Layout.FontScale
+	renderOpt.Spacing = cfg.Layout.Spacing
+	renderOpt.AutoStroke = cfg.Layout.StrokeWidth < 0
+	if cfg.Layout.MinFontSize > 0 {
+		renderOpt.MinSize = cfg.Layout.MinFontSize
+		renderOpt.MaxSize = max(18, cfg.Layout.MinFontSize/cfg.Layout.FontScale)
+	}
+	if cfg.Layout.StrokeWidth >= 0 {
+		renderOpt.StrokeWidth = cfg.Layout.StrokeWidth
 	}
 
 	outPages := make([]cbz.Page, 0, len(pages))
@@ -508,8 +672,22 @@ func run() (err error) {
 				active = append(active, b)
 			}
 		}
+		if len(active) != len(pr.blocks) {
+			pageMetrics[i].Outcome = "translation_failed"
+			outPages = append(outPages, pg)
+			reportPage(i)
+			continue
+		}
 		if len(active) == 0 {
 			pageMetrics[i].Outcome = "no_translation"
+			if len(pr.blocks) == 0 && pageMetrics[i].OCRFailed == 0 && !cfg.Output.PreserveNoText {
+				if img, e := decodeImage(pg.Bytes); e == nil {
+					if data, ext, e := pageimage.Encode(img, outputOptions(cfg)); e == nil {
+						pg.Bytes = data
+						pg.Name = strings.TrimSuffix(pg.Name, filepath.Ext(pg.Name)) + ext
+					}
+				}
+			}
 			pr.mask, pr.ocr, pr.blocks = nil, nil, nil
 			outPages = append(outPages, pg)
 			reportPage(i)
@@ -530,6 +708,7 @@ func run() (err error) {
 		// including those outside the bubble's largest inner rectangle.
 		endSpan = trace.Span("operation", "mask_prepare", i, -1)
 		mask := restrictMask(pr.mask, active)
+		lap.MaskLimit = maskOwnership(pr.mask.Bounds(), active)
 		endSpan(nil)
 		if *work != "" {
 			writePNG(filepath.Join(*work, fmt.Sprintf("mask%02d.png", i)), mask)
@@ -576,6 +755,11 @@ func run() (err error) {
 				perf.Count(perf.WithLocation(ctx, i, k), "layout_box_fallbacks", 1)
 			}
 			active[k].TextColor = textColor(img, sample)
+			if cfg.Layout.Color != "auto" {
+				var r, g, b uint8
+				fmt.Sscanf(cfg.Layout.Color, "#%02x%02x%02x", &r, &g, &b)
+				active[k].TextColor = color.RGBA{R: r, G: g, B: b, A: 255}
+			}
 		}
 		endSpan(nil)
 		tRender := time.Now()
@@ -594,7 +778,7 @@ func run() (err error) {
 		}
 		tEncode := time.Now()
 		endSpan = trace.Span("operation", "encode", i, -1)
-		data, err := encodeJPEG(final, 92)
+		data, ext, err := pageimage.Encode(final, outputOptions(cfg))
 		endSpan(err)
 		b.EncodeMS += time.Since(tEncode).Milliseconds()
 		if err != nil {
@@ -604,21 +788,24 @@ func run() (err error) {
 			reportPage(i)
 			continue
 		}
-		outPages = append(outPages, cbz.Page{Name: pg.Name, Bytes: data})
+		outPages = append(outPages, cbz.Page{Name: strings.TrimSuffix(pg.Name, filepath.Ext(pg.Name)) + ext, Bytes: data})
 		pageMetrics[i].Outcome = "rendered"
 		pageMetrics[i].Rendered = len(active)
 		if *work != "" {
-			_ = os.WriteFile(filepath.Join(*work, fmt.Sprintf("p%02d.jpg", i)), data, 0o644)
+			_ = os.WriteFile(filepath.Join(*work, fmt.Sprintf("p%02d%s", i, ext)), data, 0o644)
 		}
 		reportPage(i)
 	}
 	log.Printf("finish done in %s", time.Since(finishStart).Round(time.Second))
+	assignOutputNames(outPages)
 
 	tWrite := time.Now()
 	validateMS := int64(0)
 	checkCount := 0
+	preservedUndecodable := 0
 	endSpan = trace.Span("operation", "archive_write_including_validate", -1, -1)
-	err = cbz.WriteCBZValidated(*out, outPages, func(part string) error {
+	stagedArchive := filepath.Join(runDir, "result.cbz")
+	err = cbz.WriteCBZValidated(stagedArchive, outPages, func(part string) error {
 		endValidate := trace.Span("nested", "archive_validate", -1, -1)
 		var validationErr error
 		defer func() { endValidate(validationErr) }()
@@ -638,9 +825,13 @@ func run() (err error) {
 			return validationErr
 		}
 		bad := 0
-		for _, p := range check {
+		for i, p := range check {
 			if _, err := decodeImage(p.Bytes); err != nil {
-				bad++
+				if !bytes.Equal(p.Bytes, pages[i].Bytes) {
+					bad++
+				} else {
+					preservedUndecodable++
+				}
 			}
 		}
 		if bad > 0 {
@@ -650,6 +841,9 @@ func run() (err error) {
 		checkCount = len(check)
 		return nil
 	})
+	if err == nil {
+		err = publishArchive(stagedArchive, *out, *overwrite)
+	}
 	endSpan(err)
 	b.WriteMS = time.Since(tWrite).Milliseconds() - validateMS
 	b.ValidateMS = validateMS
@@ -658,7 +852,7 @@ func run() (err error) {
 	}
 	log.Printf("progress save %d/%d", len(outPages), len(outPages))
 	log.Printf("wrote %s (%d pages)", *out, len(outPages))
-	log.Printf("validate output: %d pages, all decode", checkCount)
+	log.Printf("validate output: %d pages checked, %d undecodable original pages retained", checkCount, preservedUndecodable)
 	log.Printf("progress done %d/%d", len(outPages), len(outPages))
 	b.report(log.Printf, time.Since(started))
 	if *benchPath != "" {
