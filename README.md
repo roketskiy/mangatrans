@@ -117,6 +117,9 @@ UI 还创建带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object，并把引�
 
 独立测量脚本接受任意 CBZ/ZIP：
 
+用于测试的漫画文件在TestResourse
+
+
 ```powershell
 python -m pip install -r .\scripts\requirements-bench.txt
 # 先重新构建引擎，使 exe 支持 -perf-json

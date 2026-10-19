@@ -143,12 +143,27 @@ func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertic
 		gap = spacing[0]
 	}
 	thickness := int(math.Ceil(fontPx * 1.55 * gap))
-	if thickness < 4 {
-		thickness = 4
-	}
+	metrics := font.Face(size, fill).Metrics()
+	minimumThickness := int(math.Ceil((metrics.Ascent + metrics.Descent) / pxToMM))
+	thickness = max(4, thickness, minimumThickness)
 	lanes := scanShapeLanes(mask, bounds, vertical, thickness)
 	if len(lanes) == 0 {
 		return nil, false
+	}
+	type measureKey struct{ width, height, start int }
+	type measurement struct {
+		text *canvas.Text
+		n    int
+	}
+	measurements := make(map[measureKey]measurement)
+	measure := func(lane shapeLane, start int) (*canvas.Text, int) {
+		key := measureKey{lane.rect.Dx(), lane.rect.Dy(), start}
+		if cached, ok := measurements[key]; ok {
+			return cached.text, cached.n
+		}
+		text, n := bestLaneText(lane, vertical, size, font, fill, runes[start:])
+		measurements[key] = measurement{text, n}
+		return text, n
 	}
 	// Estimate per-lane capacities cheaply, then validate candidate windows
 	// with actual canvas overflow measurements.
@@ -191,7 +206,7 @@ func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertic
 				if relax < 2 && touchesAny(window, occupied) {
 					continue
 				}
-				if _, ok := fitLaneWindow(lanes[i:j+1], runes, vertical, size, font, fill); !ok {
+				if _, ok := fitLaneWindow(lanes[i:j+1], runes, measure); !ok {
 					continue
 				}
 				count := j - i + 1
@@ -214,7 +229,7 @@ func shapeLayout(mask *image.Alpha, bounds image.Rectangle, runes []rune, vertic
 		return nil, false
 	}
 
-	placements, ok := fitLaneWindow(lanes[start:end], runes, vertical, size, font, fill)
+	placements, ok := fitLaneWindow(lanes[start:end], runes, measure)
 	if !ok {
 		return nil, false
 	}
@@ -240,14 +255,14 @@ func windowRect(lanes []shapeLane) image.Rectangle {
 	return r
 }
 
-func fitLaneWindow(lanes []shapeLane, runes []rune, vertical bool, size float64, font *canvas.Font, fill color.Color) ([]shapePlacement, bool) {
+func fitLaneWindow(lanes []shapeLane, runes []rune, measure func(shapeLane, int) (*canvas.Text, int)) ([]shapePlacement, bool) {
 	var out []shapePlacement
 	pos := 0
 	for _, lane := range lanes {
 		if pos == len(runes) {
 			break
 		}
-		text, n := bestLaneText(lane, vertical, size, font, fill, runes[pos:])
+		text, n := measure(lane, pos)
 		if n == 0 {
 			continue
 		}
