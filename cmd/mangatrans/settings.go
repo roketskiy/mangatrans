@@ -20,6 +20,8 @@ import (
 	"mangatrans/settings"
 )
 
+const inferenceCacheVersion = 13
+
 type storedPage struct {
 	Index  int            `json:"index"`
 	Mask   *image.Gray    `json:"mask"`
@@ -56,7 +58,7 @@ func inferenceKey(p paths, c settings.Config, conf float64, pages []cbz.Page, gl
 		Translation settings.Translation
 		Batch       int
 		Confidence  float64
-	}{4, c.Recognition, c.Translation, c.Processing.BatchPages, conf}); err != nil {
+	}{inferenceCacheVersion, c.Recognition, c.Translation, c.Processing.BatchPages, conf}); err != nil {
 		return "", err
 	}
 	for _, path := range []string{p.llamaExe, p.ocrModel, p.ocrMMProj, p.mtModel, p.detModel, p.bubbleSegModel, glossaryPath} {
@@ -88,7 +90,7 @@ func inferenceKey(p paths, c settings.Config, conf float64, pages []cbz.Page, gl
 }
 
 func recordFor(key string, pages []*pageResult) inferenceRecord {
-	r := inferenceRecord{Version: 4, Key: key}
+	r := inferenceRecord{Version: inferenceCacheVersion, Key: key}
 	for _, p := range pages {
 		r.Pages = append(r.Pages, storedPage{p.index, p.mask, p.blocks, p.ocr})
 	}
@@ -115,7 +117,7 @@ func loadInference(path, key string, pageCount int) ([]*pageResult, error) {
 	if err = decoder.Decode(&extra); err != io.EOF {
 		return nil, fmt.Errorf("invalid cache trailer: %v", err)
 	}
-	if r.Version != 4 || r.Key != key || len(r.Pages) != pageCount {
+	if r.Version != inferenceCacheVersion || r.Key != key || len(r.Pages) != pageCount {
 		return nil, fmt.Errorf("stale or incomplete cache")
 	}
 	var pages []*pageResult

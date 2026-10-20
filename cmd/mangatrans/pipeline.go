@@ -64,38 +64,44 @@ func recognizeRegions(ctx context.Context, img image.Image, regions []bubble.Tex
 	return results
 }
 
-// IDs are local to one request. Its location map disambiguates identical
-// page-local IDs without making the model generate ever-growing numbers.
-type translationLocation struct{ page, block int }
 type translationBatch struct {
-	blocks    []translate.Block
-	locations map[int]translationLocation
+	blocks     []translate.Block
+	blockCount int
 }
 
+// planTranslations groups OCR regions into scheduling units of at most size
+// targets spanning at most pageSpan consecutive pages. The translator sends one
+// target per model request, so the unit bounds retry bookkeeping, progress
+// reporting, and diagnostics rather than one model payload.
 func planTranslations(pages []*pageResult, size, pageSpan int) []translationBatch {
+	if size < 1 {
+		size = 1
+	}
+	if pageSpan < 1 {
+		pageSpan = 1
+	}
 	var batches []translationBatch
-	batch := translationBatch{locations: make(map[int]translationLocation)}
-	firstPage, nextID := -1, 1
+	batch := translationBatch{}
+	firstPage := -1
 	flush := func() {
-		if len(batch.blocks) == 0 {
+		if batch.blockCount == 0 {
 			return
 		}
 		batches = append(batches, batch)
-		batch = translationBatch{locations: make(map[int]translationLocation)}
+		batch = translationBatch{}
 		firstPage = -1
-		nextID = 1
 	}
 	for _, page := range pages {
 		for k, text := range page.ocr {
-			if len(batch.blocks) == size || (firstPage >= 0 && page.index-firstPage >= pageSpan) {
+			if batch.blockCount == size || (firstPage >= 0 && page.index-firstPage >= pageSpan) {
 				flush()
 			}
 			if firstPage < 0 {
 				firstPage = page.index
 			}
-			batch.blocks = append(batch.blocks, translate.Block{ID: nextID, Text: text})
-			batch.locations[nextID] = translationLocation{page: page.index, block: k}
-			nextID++
+			block := translate.Block{Key: translate.TargetKey{Page: page.index, Region: k}, Text: text}
+			batch.blocks = append(batch.blocks, block)
+			batch.blockCount++
 		}
 	}
 	flush()

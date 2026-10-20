@@ -11,6 +11,7 @@ import (
 
 	"mangatrans/internal/bubble"
 	"mangatrans/internal/render"
+	"mangatrans/internal/translate"
 )
 
 func TestOCRWorkersPreserveBoxOrderAndBoundConcurrency(t *testing.T) {
@@ -52,38 +53,39 @@ func TestOCRWorkersPreserveBoxOrderAndBoundConcurrency(t *testing.T) {
 	}
 }
 
-func TestTranslationBatchesKeepIDsAndPageReferences(t *testing.T) {
+func TestTranslationBatchesKeepPageAndBlockIdentity(t *testing.T) {
 	pages := []*pageResult{{index: 0, ocr: []string{"甲", "乙"}}, {index: 1, ocr: []string{"丙", "丁"}}, {index: 4, ocr: []string{"戊"}}}
 	batches := planTranslations(pages, 3, 2)
 	if len(batches) != 3 {
 		t.Fatalf("got %d batches, want 3", len(batches))
 	}
+	originals := map[int][]string{
+		0: {"甲", "乙"},
+		1: {"丙", "丁"},
+		4: {"戊"},
+	}
 	count := 0
 	for _, batch := range batches {
-		seen := map[int]bool{}
-		if len(batch.blocks) > 3 {
+		if batch.blockCount > 3 {
 			t.Fatal("batch exceeds size")
 		}
 		for _, block := range batch.blocks {
-			if seen[block.ID] {
-				t.Fatalf("duplicate id %d", block.ID)
-			}
-			seen[block.ID] = true
 			count++
-			loc := batch.locations[block.ID]
-			var original string
-			for _, page := range pages {
-				if page.index == loc.page {
-					original = page.ocr[loc.block]
-				}
+			sourcePage, ok := originals[block.Key.Page]
+			if !ok || block.Key.Region < 0 || block.Key.Region >= len(sourcePage) {
+				t.Fatalf("invalid page %d region %d", block.Key.Page, block.Key.Region)
 			}
-			if original != block.Text {
-				t.Fatalf("id %d mapped to wrong source", block.ID)
+			source := sourcePage[block.Key.Region]
+			if source != block.Text {
+				t.Fatalf("page %d region %d mapped to wrong source", block.Key.Page, block.Key.Region)
 			}
 		}
 	}
 	if count != 5 || batches[2].blocks[0].Text != "戊" {
 		t.Fatal("lost text or crossed the page-span boundary")
+	}
+	if batches[0].blocks[0].Key != (translate.TargetKey{Page: 0, Region: 0}) || batches[0].blocks[2].Key != (translate.TargetKey{Page: 1, Region: 1}) {
+		t.Fatal("page/region identity was lost at a batch boundary")
 	}
 	separate := planTranslations(pages, 12, 1)
 	if len(separate) != 3 {
@@ -139,7 +141,7 @@ func TestSplitRegionOCRAndEraseCannotConsumeSibling(t *testing.T) {
 	}
 	pages := []*pageResult{{index: 0, ocr: []string{"upper original", "lower original"}}}
 	batches := planTranslations(pages, 12, 2)
-	if len(batches) != 1 || len(batches[0].blocks) != 2 || batches[0].blocks[0].Text != "upper original" || batches[0].blocks[1].Text != "lower original" {
+	if len(batches) != 1 || batches[0].blockCount != 2 || len(batches[0].blocks) != 2 || batches[0].blocks[0].Text != "upper original" || batches[0].blocks[1].Text != "lower original" {
 		t.Fatal("independent OCR dialogues were merged for translation")
 	}
 }

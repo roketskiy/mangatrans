@@ -484,6 +484,9 @@ func run() (err error) {
 
 		tr := translate.New(mtSrv, glossary)
 		tr.BatchAttempts = cfg.Translation.BatchAttempts
+		if *work != "" {
+			tr.DiagnosticsDir = filepath.Join(*work, "translation")
+		}
 		const perBatch = 12
 		mtStart := time.Now()
 		byIndex := make(map[int]*pageResult, len(results))
@@ -491,60 +494,31 @@ func run() (err error) {
 			byIndex[pr.index] = pr
 		}
 		for batchIndex, batch := range planTranslations(results, perBatch, *batchPages) {
-			first := batch.locations[batch.blocks[0].ID]
-			log.Printf("progress translate %d/%d", first.page+1, len(pages))
+			log.Printf("progress translate %d/%d", batch.blocks[0].Key.Page+1, len(pages))
 			tTr := time.Now()
 			endSpan = trace.Span("operation", "translate_batch", -1, batchIndex)
-			got, err := tr.TranslateBatch(perf.WithLocation(ctx, -1, batchIndex), batch.blocks)
+			got, err := tr.TranslateBatch(perf.WithLocation(ctx, -1, batchIndex), batchIndex, batch.blocks)
 			endSpan(err)
 			b.TranslateMS += time.Since(tTr).Milliseconds()
-			b.TranslateBlocks += len(batch.blocks)
+			b.TranslateBlocks += batch.blockCount
+			for key, text := range got {
+				page, ok := byIndex[key.Page]
+				if !ok {
+					log.Printf("batch %d: translation returned unknown page %d region %d", batchIndex, key.Page, key.Region)
+					continue
+				}
+				if key.Region < 0 || key.Region >= len(page.blocks) {
+					log.Printf("batch %d: translation returned unknown page %d region %d", batchIndex, key.Page, key.Region)
+					continue
+				}
+				if text != "" {
+					page.blocks[key.Region].Text = text
+				}
+			}
 			if err != nil {
 				log.Printf("batch %d: translate failed: %v", batchIndex, err)
-				continue
-			}
-			for id, txt := range got {
-				if loc, ok := batch.locations[id]; ok && txt != "" {
-					byIndex[loc.page].blocks[loc.block].Text = txt
-				}
 			}
 		}
-		// Single-line retry for blocks the batch model left empty. Name lists and
-		// lines that begin with ellipses often trigger an empty string, and
-		// keeping the Japanese there is worse than one extra request.
-		retries := 0
-		for _, pr := range results {
-			for k := range pr.blocks {
-				if pr.blocks[k].Text != "" {
-					continue
-				}
-				tRetry := time.Now()
-				endSpan = trace.Span("operation", "translate_retry", pr.index, k)
-				attempts := 1
-				var txt string
-				var err error
-				for attempt := 0; attempt < attempts; attempt++ {
-					txt, err = tr.TranslateOne(perf.WithLocation(ctx, pr.index, k), pr.ocr[k])
-					if err == nil && !translate.Untranslated(pr.ocr[k], txt) {
-						break
-					}
-					if ctx.Err() != nil {
-						break
-					}
-				}
-				endSpan(err)
-				b.TranslateMS += time.Since(tRetry).Milliseconds()
-				if err != nil {
-					log.Printf("page %d block %d: single retry failed: %v", pr.index, k+1, err)
-					continue
-				}
-				if !translate.Untranslated(pr.ocr[k], txt) {
-					pr.blocks[k].Text = txt
-					retries++
-				}
-			}
-		}
-		log.Printf("single-line retries: %d", retries)
 		for _, pr := range results {
 			for _, blk := range pr.blocks {
 				if blk.Text != "" {
