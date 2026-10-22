@@ -20,7 +20,7 @@ import (
 	"mangatrans/settings"
 )
 
-const inferenceCacheVersion = 13
+const inferenceCacheVersion = 14
 
 type storedPage struct {
 	Index  int            `json:"index"`
