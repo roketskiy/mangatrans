@@ -267,7 +267,12 @@ func run() (err error) {
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
+	// A whole book legitimately runs for hours, so there is no global
+	// deadline: one used to fail every remaining page of long books once it
+	// expired. Individual requests carry their own timeouts instead (LLM calls
+	// bound themselves in this package and ocrBox), and stopping the run is
+	// handled by killing the process tree.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ctx = perf.WithRecorder(ctx, trace)
 	cacheDir := filepath.Join(filepath.Dir(cacheBase), "."+filepath.Base(cacheBase)+".mangatrans-cache")
@@ -608,20 +613,19 @@ func run() (err error) {
 			reportPage(i)
 			continue
 		}
-		// Only erase boxes that actually have a translation. Otherwise a
-		// failed or skipped block would lose its original text and gain
-		// nothing, which is strictly worse than leaving the page alone.
+		// Only erase boxes that actually have a translation, so a failed
+		// block keeps its original Japanese text instead of losing it and
+		// gaining nothing. The rest of the page still ships translated;
+		// reverting the whole page over one block wasted entire books.
 		active := make([]render.Block, 0, len(pr.blocks))
 		for _, b := range pr.blocks {
 			if b.Text != "" {
 				active = append(active, b)
 			}
 		}
-		if len(active) != len(pr.blocks) {
-			pageMetrics[i].Outcome = "translation_failed"
-			outPages = append(outPages, pg)
-			reportPage(i)
-			continue
+		if len(active) < len(pr.blocks) {
+			log.Printf("page %d: %d of %d blocks untranslated, keeping their original text", i+1, len(pr.blocks)-len(active), len(pr.blocks))
+			perf.Count(perf.WithLocation(ctx, i, -1), "blocks_kept_original", len(pr.blocks)-len(active))
 		}
 		if len(active) == 0 {
 			pageMetrics[i].Outcome = "no_translation"

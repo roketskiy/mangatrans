@@ -144,6 +144,9 @@ type ChatMessage struct {
 type chatRequest struct {
 	Messages       []ChatMessage   `json:"messages"`
 	Temperature    float64         `json:"temperature"`
+	TopP           float64         `json:"top_p,omitempty"`
+	TopK           int             `json:"top_k,omitempty"`
+	RepeatPenalty  float64         `json:"repeat_penalty,omitempty"`
 	MaxTokens      int             `json:"max_tokens"`
 	Stream         bool            `json:"stream"`
 	ResponseFormat *responseFormat `json:"response_format,omitempty"`
@@ -159,78 +162,90 @@ type chatResponse struct {
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
 }
 
+// Sampling carries the per-request sampling overrides. Temperature is always
+// sent; the remaining zero fields keep llama-server's own defaults.
+type Sampling struct {
+	Temperature   float64
+	TopP          float64
+	TopK          int
+	RepeatPenalty float64
+}
+
 // Chat sends one chat completion and returns the assistant message.
-func (s *Server) Chat(ctx context.Context, messages []ChatMessage, temperature float64, maxTokens int) (string, error) {
-	return s.chat(ctx, messages, temperature, maxTokens, nil)
+func (s *Server) Chat(ctx context.Context, messages []ChatMessage, sampling Sampling, maxTokens int) (string, error) {
+	content, _, _, err := s.chatStatus(ctx, messages, sampling, maxTokens, nil)
+	return content, err
 }
 
 // ChatJSON asks llama-server to constrain the reply to a JSON schema. If the
-// server build does not support response_format, it retries without it.
-func (s *Server) ChatJSON(ctx context.Context, messages []ChatMessage, schema map[string]any, temperature float64, maxTokens int) (string, error) {
+// server build does not support response_format, it retries without it. The
+// second return reports why generation ended: "length" means the reply hit
+// max_tokens and was likely cut off mid-JSON.
+func (s *Server) ChatJSON(ctx context.Context, messages []ChatMessage, schema map[string]any, sampling Sampling, maxTokens int) (string, string, error) {
 	rf := &responseFormat{Type: "json_object", Schema: schema}
-	content, status, err := s.chatStatus(ctx, messages, temperature, maxTokens, rf)
+	content, status, finish, err := s.chatStatus(ctx, messages, sampling, maxTokens, rf)
 	if err != nil && status == 400 {
-		return s.Chat(ctx, messages, temperature, maxTokens)
+		content, chatErr := s.Chat(ctx, messages, sampling, maxTokens)
+		return content, "", chatErr
 	}
-	return content, err
+	return content, finish, err
 }
 
-func (s *Server) chat(ctx context.Context, messages []ChatMessage, temperature float64, maxTokens int, rf *responseFormat) (string, error) {
-	content, _, err := s.chatStatus(ctx, messages, temperature, maxTokens, rf)
-	return content, err
-}
-
-func (s *Server) chatStatus(ctx context.Context, messages []ChatMessage, temperature float64, maxTokens int, rf *responseFormat) (content string, status int, err error) {
+func (s *Server) chatStatus(ctx context.Context, messages []ChatMessage, sampling Sampling, maxTokens int, rf *responseFormat) (content string, status int, finish string, err error) {
 	endRequest := perf.Request(ctx, "llm_http")
 	defer func() { endRequest(err) }()
 	body, err := json.Marshal(chatRequest{
 		Messages:       messages,
-		Temperature:    temperature,
+		Temperature:    sampling.Temperature,
+		TopP:           sampling.TopP,
+		TopK:           sampling.TopK,
+		RepeatPenalty:  sampling.RepeatPenalty,
 		MaxTokens:      maxTokens,
 		ResponseFormat: rf,
 	})
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", s.port)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", resp.StatusCode, err
+		return "", resp.StatusCode, "", err
 	}
 	if resp.StatusCode != 200 {
-		return "", resp.StatusCode, fmt.Errorf("chat http %d: %s", resp.StatusCode, truncate(string(data), 400))
+		return "", resp.StatusCode, "", fmt.Errorf("chat http %d: %s", resp.StatusCode, truncate(string(data), 400))
 	}
 
 	var cr chatResponse
 	if err := json.Unmarshal(data, &cr); err != nil {
-		return "", resp.StatusCode, fmt.Errorf("decode response: %w", err)
+		return "", resp.StatusCode, "", fmt.Errorf("decode response: %w", err)
 	}
 	if cr.Error != nil {
-		return "", resp.StatusCode, fmt.Errorf("server error: %s", cr.Error.Message)
+		return "", resp.StatusCode, "", fmt.Errorf("server error: %s", cr.Error.Message)
 	}
 	if len(cr.Choices) == 0 {
-		return "", resp.StatusCode, fmt.Errorf("empty choices")
+		return "", resp.StatusCode, "", fmt.Errorf("empty choices")
 	}
-	return cr.Choices[0].Message.Content, resp.StatusCode, nil
+	return cr.Choices[0].Message.Content, resp.StatusCode, cr.Choices[0].FinishReason, nil
 }
 
 // Kill stops the server process.

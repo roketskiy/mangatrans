@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"mangatrans/internal/llm"
@@ -82,8 +83,20 @@ type translationDiagnostic struct {
 
 // A single dialogue line is short. A low token ceiling bounds the model's
 // known degenerate repetition loops instead of letting them run to the context
-// limit.
+// limit. A reply that hits the ceiling is retried with more tokens rather than
+// accepted or repeated verbatim.
 const maxReplyTokens = 512
+
+// maxEscalatedTokens bounds the truncated-reply retry. One escalation covers
+// every realistic dialogue line; capping it keeps a runaway prompt from
+// generating to the context limit.
+const maxEscalatedTokens = 4096
+
+// recommendedSampling is Tencent's published inference setting for the Hy-MT
+// series (HF model card): temperature 0.7, top_p 0.6, top_k 20,
+// repetition_penalty 1.05. The randomness also gives the retry hint room to
+// change the outcome instead of reproducing a rejected reply verbatim.
+var recommendedSampling = llm.Sampling{Temperature: 0.7, TopP: 0.6, TopK: 20, RepeatPenalty: 1.05}
 
 const systemPrompt = "你是一个专业的日文漫画翻译，把日文对白翻译成简体中文。\n\n" +
 	"【规则】\n" +
@@ -132,6 +145,7 @@ func (c *Client) TranslateBatch(ctx context.Context, batchIndex int, blocks []Bl
 		resolved := false
 		var lastErr error
 		var lastText string
+		tokens := maxReplyTokens
 		for attempt := 1; attempt <= attempts; attempt++ {
 			if ctx.Err() != nil {
 				lastErr = ctx.Err()
@@ -141,7 +155,7 @@ func (c *Client) TranslateBatch(ctx context.Context, batchIndex int, blocks []Bl
 			if attempt > 1 {
 				hint = retryHint(target, lastText)
 			}
-			got, issues, requestErr, diagnosticErr := c.translateRequest(ctx, batchIndex, attempt, target, hint)
+			got, issues, finish, requestErr, diagnosticErr := c.translateRequest(ctx, batchIndex, attempt, target, hint, tokens)
 			if diagnosticErr != nil {
 				diagnosticErrors = append(diagnosticErrors, diagnosticErr.Error())
 			}
@@ -150,6 +164,7 @@ func (c *Client) TranslateBatch(ctx context.Context, batchIndex int, blocks []Bl
 				continue
 			}
 			if text, ok := got[target.key]; ok {
+				text = trimJSONDebris(text)
 				if !Untranslated(target.text, text) {
 					result[target.key] = text
 					resolved = true
@@ -157,6 +172,14 @@ func (c *Client) TranslateBatch(ctx context.Context, batchIndex int, blocks []Bl
 				}
 				lastText = text
 				lastErr = fmt.Errorf("page %d region %d kept Japanese text %q", target.key.Page, target.key.Region, text)
+				continue
+			}
+			if finish == "length" && tokens < maxEscalatedTokens {
+				// The reply was cut off before it closed the JSON, so parsing
+				// cannot succeed at this ceiling. Escalate once instead of
+				// repeating a doomed request.
+				tokens = min(tokens*4, maxEscalatedTokens)
+				lastErr = fmt.Errorf("page %d region %d reply hit the token ceiling, retrying with %d", target.key.Page, target.key.Region, tokens)
 				continue
 			}
 			lastText = ""
@@ -183,11 +206,15 @@ func (c *Client) TranslateBatch(ctx context.Context, batchIndex int, blocks []Bl
 	return result, nil
 }
 
-func (c *Client) translateRequest(ctx context.Context, batchIndex, attempt int, target translationTarget, hint string) (Result, []string, error, error) {
+func (c *Client) translateRequest(ctx context.Context, batchIndex, attempt int, target translationTarget, hint string, maxTokens int) (Result, []string, string, error, error) {
+	// Bound each request so one stalled call cannot hold a page — or, with
+	// concurrent workers, a worker slot — until the whole-book budget dies.
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	request := translationRequest{Blocks: []requestBlock{{ID: target.id, Source: target.text}}}
 	payload, err := json.Marshal(request)
 	if err != nil {
-		return nil, nil, err, nil
+		return nil, nil, "", err, nil
 	}
 	userPayload := withGlossary(string(payload), target, c.glossary)
 	if hint != "" {
@@ -197,7 +224,7 @@ func (c *Client) translateRequest(ctx context.Context, batchIndex, attempt int, 
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: userPayload},
 	}
-	content, requestErr := c.srv.ChatJSON(ctx, messages, batchSchema, 0.0, maxReplyTokens)
+	content, finish, requestErr := c.srv.ChatJSON(ctx, messages, batchSchema, recommendedSampling, maxTokens)
 	var responseBlocks []responseBlock
 	var parseErr error
 	result := make(Result)
@@ -238,12 +265,12 @@ func (c *Client) translateRequest(ctx context.Context, batchIndex, attempt int, 
 		diagnosticErr = writeDiagnostic(c.DiagnosticsDir, record)
 	}
 	if requestErr != nil {
-		return result, issues, fmt.Errorf("translate request: %w", requestErr), diagnosticErr
+		return result, issues, finish, fmt.Errorf("translate request: %w", requestErr), diagnosticErr
 	}
 	if parseErr != nil {
-		return result, issues, fmt.Errorf("translate parse: %w", parseErr), diagnosticErr
+		return result, issues, finish, fmt.Errorf("translate parse: %w", parseErr), diagnosticErr
 	}
-	return result, issues, nil, diagnosticErr
+	return result, issues, finish, nil, diagnosticErr
 }
 
 // retryHint tells the model what failed in the previous reply. Repeating the
@@ -256,6 +283,16 @@ func retryHint(target translationTarget, previous string) string {
 	}
 	return fmt.Sprintf("上一版译文 %q 里还留着日文假名 %s，未通过检查。请把 %s 和所有助词、送假名、动词词尾都译成简体中文，把残句补成完整的中文句子，只输出 JSON 对象。",
 		previous, hiraganaList(previous), hiraganaList(previous))
+}
+
+// jsonDebrisTail matches stray JSON closing tokens the model sometimes
+// repeats inside the string value at non-zero temperature ("……！”}}]").
+var jsonDebrisTail = regexp.MustCompile(`(?:[”"]?\s*[}\]]){1,4}\s*$`)
+
+// trimJSONDebris removes that tail. Dialogue never legitimately ends in
+// closing braces, and the check requires them, so plain quotes are safe.
+func trimJSONDebris(s string) string {
+	return strings.TrimSpace(jsonDebrisTail.ReplaceAllString(strings.TrimSpace(s), ""))
 }
 
 func hiraganaList(text string) string {

@@ -535,6 +535,9 @@ func isNoise(s string) bool {
 }
 
 func ocrBox(ctx context.Context, srv *llm.Server, crop image.Image) (string, error) {
+	// Bound the call so one stalled request cannot hold a page or a worker.
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, crop); err != nil {
 		return "", fmt.Errorf("encode crop: %w", err)
