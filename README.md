@@ -93,6 +93,29 @@ go build -o bin\mangatrans.exe .\cmd\mangatrans
 
 只把当前批次里出现的词条注入提示词，不会拖慢其他页。
 
+## 单页分析
+
+`cmd/probe-page` 把一页跑完整条流水线，每个阶段落一张图和一份记录，用于定位「某句话为什么没翻 / 为什么没渲染」这类问题。
+
+```powershell
+.\bin\probe-page.exe -in "页面.png 或 book.cbz" [-page 0] -out 分析目录 [-settings s.json] [-conf 0.35]
+```
+
+| 输出 | 内容 |
+| --- | --- |
+| `01-source.png` | 解码后的原页 |
+| `02-detect.png` | 检测行框叠加（紫框） |
+| `03-regions.png` | 合并后对话区块：绿=已翻译，橙=噪声/空白拒绝，红=OCR 失败 |
+| `04-ocr/NN.png` | 发给 OCR 模型的精确裁剪图 |
+| `05-mask.png` | 实际使用的擦字掩码（只含已翻译的块） |
+| `06-clean.png` | 擦字修复后的干净页 |
+| `07-layout.png` | 排版结果：黄=译文块框，青=拟合的排版区域 |
+| `08-final.png` | 渲染成图 |
+| `record.json` | 每阶段耗时、检测框数、每块的框/OCR/译文/拟合区域/字色 |
+| `ocr.log`、`mt.log` | 两个 llama-server 的原始日志 |
+
+分析页和引擎逐阶段一致（同样的检测参数、列合并、噪声过滤、12 块翻译批次、掩码、干净页拟合和渲染选项）；改引擎流水线时要在同一次提交里同步这个工具，否则分析结果会失真。
+
 ## 桌面界面
 
 `mangatrans-ui.exe` 是 MyGo 写的原生窗口，只负责选文件、显示进度和日志；翻译仍由同目录的 `mangatrans.exe` 完成。
