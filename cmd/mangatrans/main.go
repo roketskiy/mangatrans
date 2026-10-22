@@ -18,14 +18,13 @@ import (
 
 	"mangatrans/internal/bubble"
 	"mangatrans/internal/cbz"
-	"mangatrans/internal/detect"
+	"mangatrans/internal/dbtext"
 	"mangatrans/internal/infer"
 	"mangatrans/internal/inpaint"
 	"mangatrans/internal/llm"
 	"mangatrans/internal/pageimage"
 	"mangatrans/internal/perf"
 	"mangatrans/internal/render"
-	"mangatrans/internal/segment"
 	"mangatrans/internal/translate"
 	"mangatrans/settings"
 )
@@ -187,7 +186,7 @@ func run() (err error) {
 		ocrModel:       envOr("MANGATRANS_OCR_MODEL", `E:\work\transl\models\PaddleOCR-VL-manga-Q4_K_M.gguf`),
 		ocrMMProj:      envOr("MANGATRANS_MMPROJ", `E:\work\transl\models\mmproj-Q8_0.gguf`),
 		mtModel:        *mtModel,
-		detModel:       envOr("MANGATRANS_DET_MODEL", `E:\work\transl\.cache\onnx-probe\comictextdetector.onnx`),
+		detModel:       envOr("MANGATRANS_DET_MODEL", `E:\work\transl\models\manga_det_v0.2.onnx`),
 		lapModel:       envOr("MANGATRANS_LAMA_MODEL", `E:\work\transl\.cache\onnx-probe\lama-manga.onnx`),
 		bubbleSegModel: envOr("MANGATRANS_BUBBLE_SEG", `E:\work\transl\models\mangalens-bubble-seg.onnx`),
 		ortDir:         envOr("MANGATRANS_ORT_DIR", `E:\work\transl\runtime\ort-cuda13`),
@@ -313,7 +312,7 @@ func run() (err error) {
 
 		tLoad = time.Now()
 		endSpan = trace.Span("operation", "load_detect", -1, -1)
-		det, err := detect.Load(p.detModel, true, 3<<30)
+		det, err := dbtext.Load(p.detModel, true, 3<<30)
 		endSpan(err)
 		if err != nil {
 			return fmt.Errorf("load detector: %w", err)
@@ -331,25 +330,8 @@ func run() (err error) {
 		defer closeDetector()
 		results = make([]*pageResult, 0, len(pages))
 
-		// Optional bubble segmenter: instance masks replace the white-interior
-		// heuristic for layout areas and split boxes at balloon boundaries.
-		var segModel *segment.Model
-		if p.bubbleSegModel != "" {
-			endSpan = trace.Span("operation", "load_bubble_seg", -1, -1)
-			segModel, err = segment.Load(p.bubbleSegModel, true, 3<<30, 1600)
-			endSpan(err)
-			if err != nil {
-				return fmt.Errorf("load bubble segmenter: %w", err)
-			}
-			defer func() {
-				end := trace.Span("operation", "unload_bubble_seg", -1, -1)
-				end(segModel.Close())
-			}()
-			log.Printf("bubble segmenter: %s", p.bubbleSegModel)
-		}
-
-		detParams := detect.DefaultParams()
-		detParams.ConfThreshold = float32(*conf)
+		detParams := dbtext.DefaultParams()
+		detParams.BoxThresh = float32(*conf)
 
 		ocrStart := time.Now()
 		for i, pg := range pages {
@@ -367,7 +349,7 @@ func run() (err error) {
 			pageMetrics[i].Width, pageMetrics[i].Height = img.Bounds().Dx(), img.Bounds().Dy()
 			tDetect := time.Now()
 			endSpan = trace.Span("operation", "detect", i, -1)
-			var res *detect.Result
+			var res *dbtext.Result
 			if cfg.Recognition.TileSize > 0 {
 				res, err = det.RunTiled(img, detParams, cfg.Recognition.TileSize)
 			} else {
@@ -386,21 +368,10 @@ func run() (err error) {
 			for j, box := range res.Boxes {
 				parentBoxes[j] = image.Rect(int(box.X), int(box.Y), int(box.X+box.W), int(box.Y+box.H))
 			}
-			var balloons []bubble.Balloon
-			if segModel != nil {
-				found, err := segModel.Run(img, segment.DefaultParams())
-				if err != nil {
-					log.Printf("page %d: bubble segmentation failed, using geometric splitters: %v", i, err)
-				}
-				for _, bub := range found {
-					balloons = append(balloons, bubble.Balloon{Box: bub.Box, Mask: bub.Mask})
-				}
-			}
-			var regions []bubble.TextRegion
-			if len(balloons) > 0 {
-				regions = bubble.SplitWithBubbles(img, res.Mask, balloons, parentBoxes)
-			} else {
-				regions = bubble.SplitTextRegions(img, res.Mask, parentBoxes)
+			parentBoxes = bubble.MergeDialogueColumns(parentBoxes)
+			regions := make([]bubble.TextRegion, len(parentBoxes))
+			for i, box := range parentBoxes {
+				regions[i] = bubble.TextRegion{Box: box}
 			}
 			pageMetrics[i].OCRRegions = len(regions)
 			endSpan(nil)

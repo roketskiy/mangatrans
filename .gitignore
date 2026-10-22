@@ -6,6 +6,9 @@
 # Local scratch: model downloads, probe output, spike artifacts
 /.cache/
 
+# Code intelligence index
+/.codegraph/
+
 # Agent skills configuration
 .agents/
 skills-lock.json

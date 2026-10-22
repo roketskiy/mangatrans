@@ -4,7 +4,7 @@
 
 ## 流水线
 
-1. **检测**：ComicTextDetector（ONNX）一次前向得到文本框、文本分割图和 DBNet 概率图。掩码按 koharu-slim 的做法融合 `max(sigmoid((shrink-thresh)*50), unet)`，再 close(10) + dilate(3)。
+1. **检测**：PP-OCRv6_manga 的 DB 检测器（ONNX，`manga_det_v0.2.onnx`）输出逐行文本概率图；连通域得到文本框，按 DB unclip 规则外扩，再按列间距合并成对话区块（每个气泡一个识别单元）。检测框填充并膨胀后作为擦字掩码。
 2. **OCR**：PaddleOCR-VL-For-Manga（GGUF，llama.cpp）逐框识别，保留竖排和拟声词。
 3. **翻译**：Hy-MT2-1.8B（GGUF，llama.cpp）按页批量翻译，JSON schema 约束输出；缺失的 id 单独重试。仍为空、原样返回或带假名的回复会被拒绝，该框保留原文，避免把日文当成译文画上去。
 4. **擦字**：LaMa（ONNX）按连通域分窗修补；纯色气泡走快速填充，不跑模型。单页擦字或排版失败时整页回退为原图，不会在未擦干净的原图上叠字，也不会中断整本任务。
@@ -27,7 +27,7 @@ OCR 和翻译串行使用 GPU：OCR 模型先卸载，再加载翻译模型。
 
 | 用途 | 文件 | 来源 |
 | --- | --- | --- |
-| 检测 | `comictextdetector.onnx` (90 MB) | `mayocream/koharu` |
+| 检测 | `manga_det_v0.2.onnx` (1.8 MB) | `Kellenok/PP-OCRv6_manga` |
 | 擦字 | `lama-manga.onnx` (198 MB) | `mayocream/lama-manga-onnx` |
 | OCR | `PaddleOCR-VL-manga-Q4_K_M.gguf` (286 MB) | `LunarOilRig/PaddleOCR-VL-manga-GGUF` |
 | OCR 视觉塔 | `mmproj-Q8_0.gguf` (570 MB) | 同上 |
@@ -39,6 +39,8 @@ OCR 和翻译串行使用 GPU：OCR 模型先卸载，再加载翻译模型。
 $env:HTTP_PROXY='http://127.0.0.1:7897'; $env:HTTPS_PROXY=$env:HTTP_PROXY
 curl.exe -L -o models\Hy-MT2-1.8B-UD-Q4_K_XL.gguf `
   https://huggingface.co/unsloth/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-UD-Q4_K_XL.gguf
+curl.exe -L -o models\manga_det_v0.2.onnx `
+  https://huggingface.co/Kellenok/PP-OCRv6_manga/resolve/main/det/manga_det_v0.2.onnx
 ```
 
 ## 构建

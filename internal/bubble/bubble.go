@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"sort"
 )
 
 // Finder holds the white-region labels of one page.
@@ -511,4 +512,70 @@ func dilate(src []bool, w, h, r int) []bool {
 		}
 	}
 	return out
+}
+
+// MergeDialogueColumns merges line-level detector boxes into dialogue blocks
+// for vertical Japanese text: columns whose vertical ranges overlap and whose
+// horizontal gap is within one column width belong to the same speech, while
+// separate bubbles keep a clear column gap and stay apart. Lines no neighbour
+// joins remain their own block.
+func MergeDialogueColumns(boxes []image.Rectangle) []image.Rectangle {
+	if len(boxes) < 2 {
+		return boxes
+	}
+	parent := make([]int, len(boxes))
+	for i := range parent {
+		parent[i] = i
+	}
+	var find func(int) int
+	find = func(i int) int {
+		for parent[i] != i {
+			parent[i] = parent[parent[i]]
+			i = parent[i]
+		}
+		return i
+	}
+	for i := 0; i < len(boxes); i++ {
+		for j := i + 1; j < len(boxes); j++ {
+			a, b := boxes[i], boxes[j]
+			overlap := min(a.Max.Y, b.Max.Y) - max(a.Min.Y, b.Min.Y)
+			if overlap*2 < min(a.Dy(), b.Dy()) {
+				continue
+			}
+			gap := max(a.Min.X, b.Min.X) - min(a.Max.X, b.Max.X)
+			if gap > max(16, min(a.Dx(), b.Dx())) {
+				continue
+			}
+			ra, rb := find(i), find(j)
+			if ra != rb {
+				parent[rb] = ra
+			}
+		}
+	}
+	slots := make(map[int]int)
+	out := make([]image.Rectangle, 0, len(boxes))
+	for i, box := range boxes {
+		root := find(i)
+		if s, ok := slots[root]; ok {
+			out[s] = out[s].Union(box)
+			continue
+		}
+		slots[root] = len(out)
+		out = append(out, box)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if absInt(a.Min.Y-b.Min.Y) > 20 {
+			return a.Min.Y < b.Min.Y
+		}
+		return a.Min.X > b.Min.X
+	})
+	return out
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
