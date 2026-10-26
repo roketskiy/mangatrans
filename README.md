@@ -16,14 +16,14 @@ OCR 和翻译串行使用 GPU：OCR 模型先卸载，再加载翻译模型。
 ## 环境要求
 
 - Windows
-- CUDA 13 + cuDNN（本机用的是 `E:\Python312\Lib\site-packages\torch\lib` 里的 DLL）
-- Go 1.26，cgo 用 mingw-w64（MSVC 不行）
-- llama.cpp 的 `llama-server.exe`（CUDA 构建）
-- ONNX Runtime **cuda13** 构建（`onnxruntime.dll`、`onnxruntime_providers_cuda.dll`、`onnxruntime_providers_shared.dll`）
+- NVIDIA GPU + CUDA 13 运行库和 cuDNN DLL（例如 PyTorch CUDA 13 构建自带的 `torch\lib` 目录），用 `MANGATRANS_CUDA_DIR` 指向
+- Go 1.26，cgo 用 mingw-w64 的 gcc（MSVC 不行）
+- llama.cpp 的 `llama-server.exe`（CUDA 构建），用 `MANGATRANS_LLAMA` 指向
+- ONNX Runtime **cuda13** 构建（`onnxruntime.dll`、`onnxruntime_providers_cuda.dll`、`onnxruntime_providers_shared.dll`），用 `MANGATRANS_ORT_DIR` 指向所在目录
 
 ## 模型
 
-默认目录是 `E:\work\transl\models` 和 `E:\work\transl\.cache\onnx-probe`，可以用环境变量改。
+引擎内置的默认模型路径是开发机的绝对路径，克隆后请把模型放到自己的目录，用环境变量或命令行参数指定（见下文）。建议统一放在仓库外的 `models\` 目录，这个名字已被 `.gitignore` 排除。
 
 | 用途 | 文件 | 来源 |
 | --- | --- | --- |
@@ -32,11 +32,12 @@ OCR 和翻译串行使用 GPU：OCR 模型先卸载，再加载翻译模型。
 | OCR | `PaddleOCR-VL-manga-Q4_K_M.gguf` (286 MB) | `LunarOilRig/PaddleOCR-VL-manga-GGUF` |
 | OCR 视觉塔 | `mmproj-Q8_0.gguf` (570 MB) | 同上 |
 | 翻译 | `Hy-MT2-1.8B-UD-Q4_K_XL.gguf` (1.1 GB) | `unsloth/Hy-MT2-1.8B-GGUF` |
+| 气泡分割（可选） | `mangalens-bubble-seg.onnx` | YOLO11n-seg 微调权重，用 `scripts/export_mangalens.py` 导出 |
 
-下载走代理：
+如需代理下载，先把下面第一行的地址换成你自己的代理：
 
 ```powershell
-$env:HTTP_PROXY='http://127.0.0.1:7897'; $env:HTTPS_PROXY=$env:HTTP_PROXY
+$env:HTTP_PROXY='http://127.0.0.1:7890'; $env:HTTPS_PROXY=$env:HTTP_PROXY
 curl.exe -L -o models\Hy-MT2-1.8B-UD-Q4_K_XL.gguf `
   https://huggingface.co/unsloth/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-UD-Q4_K_XL.gguf
 curl.exe -L -o models\manga_det_v0.2.onnx `
@@ -46,19 +47,13 @@ curl.exe -L -o models\manga_det_v0.2.onnx `
 ## 构建
 
 ```powershell
-.\build.ps1
-```
-
-脚本会设置 mingw 的 `CC` 和 `PATH`，然后产出 `bin\mangatrans.exe`。
-
-手动构建：
-
-```powershell
 $env:CGO_ENABLED='1'
-$env:CC='E:\work\transl\runtime\toolchain\mingw64\mingw64\bin\gcc.exe'
-$env:PATH='E:\work\transl\runtime\toolchain\mingw64\mingw64\bin;'+$env:PATH
+$env:CC='<mingw-w64>\bin\gcc.exe'
+$env:PATH='<mingw-w64>\bin;'+$env:PATH
 go build -o bin\mangatrans.exe .\cmd\mangatrans
 ```
+
+把 `<mingw-w64>` 换成你的 mingw-w64 安装目录，产出 `bin\mangatrans.exe`。`cmd\probe-page` 等分析工具用同样的方式构建。
 
 ## 使用
 
@@ -80,16 +75,24 @@ go build -o bin\mangatrans.exe .\cmd\mangatrans
 | `-perf-json PATH` | 高精度事件、请求和逐页结果，供新性能脚本分析 |
 | `-ocr-workers N` | OCR 请求并发数，范围 1 到 4，默认 1；ONNX 检测会话仍串行 |
 | `-mt-batch-pages N` | 一个 12 块翻译批次最多覆盖的连续页数，范围 1 到 4，默认 2 |
+| `-text-direction DIR` | 排版方向：`vertical`（默认）、`horizontal` 或 `auto` |
+| `-settings PATH` | 从 JSON 文件读完整设置（桌面界面写的就是这个格式） |
+| `-overwrite` | 覆盖已存在的输出文件，默认拒绝覆盖 |
 
 环境变量（都可选）：
 
-`MANGATRANS_LLAMA`、`MANGATRANS_OCR_MODEL`、`MANGATRANS_MMPROJ`、`MANGATRANS_DET_MODEL`、`MANGATRANS_LAMA_MODEL`、`MANGATRANS_ORT_DIR`、`MANGATRANS_CUDA_DIR`
+`MANGATRANS_LLAMA`、`MANGATRANS_OCR_MODEL`、`MANGATRANS_MMPROJ`、`MANGATRANS_DET_MODEL`、`MANGATRANS_LAMA_MODEL`、`MANGATRANS_BUBBLE_SEG`（可选的气泡分割模型，缺失时跳过）、`MANGATRANS_ORT_DIR`、`MANGATRANS_CUDA_DIR`。桌面界面另支持 `MANGATRANS_EXE` 指定引擎位置；`probe-page` 另支持 `MANGATRANS_MT_MODEL`。
 
-术语表示例：
+术语表用 `-glossary` 传入，可以是 JSON 映射：
 
-```powershell
-.\bin\mangatrans.exe -in book.cbz -out book.zh.cbz -glossary glossary.example.json
+```json
+{
+  "妖精島の少女": "妖精岛的少女",
+  "リヒト": "里希特"
+}
 ```
+
+也可以是每行 `原文=译文` 的 UTF-8 文本文件。
 
 只把当前批次里出现的词条注入提示词，不会拖慢其他页。
 
@@ -123,16 +126,18 @@ go build -o bin\mangatrans.exe .\cmd\mangatrans
 主页的“设置”入口提供分类设置，直接显示检测阈值、翻译尝试次数、擦字像素、排版倍率和输出质量等数值。支持漫画包内静态 WebP 页面输入，以及 JPEG、PNG、WebP 页面输出。配置保存和参数范围见 [应用设置](docs/settings.md)。
 
 ```powershell
-.\build.ps1       # 先构建引擎
-.\build-ui.ps1    # 再构建界面
+# 先按上文构建引擎 bin\mangatrans.exe，再构建界面
+cd desktop
+go build -ldflags '-H=windowsgui' -o ..\bin\mangatrans-ui.exe .
+cd ..
 .\bin\mangatrans-ui.exe
 ```
 
-界面按 Windows GUI 子系统构建（`-ldflags '-H=windowsgui'`），启动时不会创建控制台。引擎和它拉起的 `llama-server.exe` 都使用 `CREATE_NO_WINDOW`；点“停止”或关闭窗口时会取消任务，并用 `taskkill /PID <pid> /T /F` 清理整棵进程树。`.\test-shutdown.ps1` 会启动一次引擎、等到 `llama-server` 子进程出现，再执行同样的清理并检查残留。
+界面按 Windows GUI 子系统构建（`-ldflags '-H=windowsgui'`），启动时不会创建控制台。引擎和它拉起的 `llama-server.exe` 都使用 `CREATE_NO_WINDOW`；点“停止”或关闭窗口时会取消任务，并用 `taskkill /PID <pid> /T /F` 清理整棵进程树。
 
 UI 还创建带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object，并把引擎加入该 job。即使从任务管理器强制结束 UI，Windows 关闭 job handle 时也会连带结束引擎和 `llama-server`。`.\bin\mangatrans-ui.exe -job-selftest` 会做一次隐藏的进程树测试，结果写到 `.cache\out\job-selftest.json`。
 
-界面构建需要 Go 1.27（脚本使用 `.cache\go1.27`），引擎仍用 Go 1.26 + cgo。两个 exe 必须放在同一目录，或者用 `MANGATRANS_EXE` 指向引擎。
+界面是独立的 go module（`desktop\`），构建需要 Go 1.27+，不依赖 cgo；引擎仍用 Go 1.26 + cgo。两个 exe 必须放在同一目录，或者用 `MANGATRANS_EXE` 指向引擎。
 
 进度不是从日志里的英文单词猜的：引擎会发出 `progress ocr|translate|inpaint|save|done N/M` 事件，界面按阶段权重和当前页数换算。四个阶段（识别文字、翻译、擦除排版、保存校验）分别显示为进行中、完成或失败；失败时进度条变红并停在真实阶段，不会停在虚假的 90%。日志自动跟随末尾，向上滚动时会暂停跟随；长路径和 panic 栈会换行显示，失败原因也会在左侧卡片中给出摘要。
 
@@ -141,9 +146,6 @@ UI 还创建带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object，并把引�
 ## 性能测试
 
 独立测量脚本接受任意 CBZ/ZIP：
-
-用于测试的漫画文件在TestResourse
-
 
 ```powershell
 python -m pip install -r .\scripts\requirements-bench.txt
@@ -163,5 +165,9 @@ python .\scripts\bench.py "D:\漫画\输入.cbz" --runs 5
 - 检测框可能把相邻两个气泡合并成一个，译文会混在一起。
 - 1.8B 翻译模型的润色能力有限，长句和语气词偶尔生硬。
 - 译文按原文字框排版；原文很短的框装不下长译文时，字号会偏小。
-- 不规则气泡（例如测试书第 6 页顶部）里的超长译文仍可能压到黑色背景；矩形排版无法完全贴合斜边。
+- 不规则气泡（斜边、异形气泡）里的超长译文仍可能压到黑色背景；矩形排版无法完全贴合斜边。
 - 默认输出 JPEG 质量 92，可在设置中改用 PNG 或 WebP。保留原图的页面可能使用原始图片格式。
+
+## 许可证
+
+[MIT](LICENSE)。本工具仅供对拥有合法来源的漫画做个人学习和研究用途的翻译，请尊重原作者与出版方的版权。
